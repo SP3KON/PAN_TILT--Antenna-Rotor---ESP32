@@ -1,0 +1,411 @@
+================================================================================
+    UNIWERSALNY STEROWNIK ROTORA SP3KON v1.0
+	PAN_TILT--Antenna-Rotor---ESP32 
+	- INSTRUKCJA OBSŁUGI
+================================================================================
+
+1. PODŁĄCZENIE ELEKTRYCZNE MODUŁÓW
+================================================================================
+
+ESP32 WROOM-32:
+----------------
+VCC      -> 3.3V (zasilanie)
+GND      -> GND (masa)
+EN       -> 3.3V (lub przycisk reset - opcjonalnie)
+
+WYŚWIETLACZ OLED SSD1306 (128x64, I2C):
+----------------------------------------
+VCC      -> 3.3V
+GND      -> GND
+SDA      -> GPIO 21 (I2C Data)
+SCL      -> GPIO 22 (I2C Clock)
+Adres I2C: 0x3C
+
+ENKODER OBROTOWY Z PRZYCISKIEM:
+--------------------------------
+VCC      -> 3.3V
+GND      -> GND
+SW       -> GPIO 27 (Przycisk, z pull-up wbudowanym)
+A        -> GPIO 32 (Kanał A, z pull-up wbudowanym)
+B        -> GPIO 33 (Kanał B, z pull-up wbudowanym)
+
+MODUŁ RS485 (komunikacja z rotorem):
+-------------------------------------
+VCC      -> 5V (lub 3.3V w zależności od modułu)
+GND      -> GND
+RO (lub TX) -> GPIO 13 (ESP32 RX)
+DI (lub RX) -> GPIO 14 (ESP32 TX)
+* Jeśli moduł ma piny RX/TX:
+  - Pin RX modułu -> GPIO 14 (TX ESP32)
+  - Pin TX modułu -> GPIO 13 (RX ESP32)
+DE/RE    -> Połączony z GND (tryb odbioru) lub sterowany osobno
+          (dla modułów z kontrolą kierunku)
+
+LED WSKAŹNIKOWY:
+-----------------
+Wbudowana LED ESP32 WROOM -> GPIO 2 (domyślnie używana w kodzie)
+
+LUB zewnętrzna LED (opcjonalnie):
+Anoda     -> GPIO 25 (zmień PIN_LED w kodzie na 25)
+Katoda    -> GND (przez rezystor 220Ω-1kΩ)
+
+UWAGI:
+------
+- Wszystkie moduły zasilane z 3.3V (oprócz RS485 jeśli wymaga 5V)
+- Wspólna masa (GND) dla wszystkich modułów
+- Piny 32 i 33 mają wbudowane pull-up, nie wymagają zewnętrznych rezystorów
+- Moduł RS485 może wymagać dodatkowego zasilania 5V w zależności od typu
+- Dla bezpieczeństwa użyj kondensatorów odsprzęgających (100µF) przy zasilaniu
+
+================================================================================
+
+2. DRZEWKO MENU
+================================================================================
+
+MAIN_SCR (Ekran główny)
+│
+├─> MENU_ROOT (Menu główne)
+│   │
+│   ├─> [0] AUTO/MANUAL - Przełączanie trybu pracy
+│   │   - kliknięcie: przełącza AUTO <-> MANUAL (bez wchodzenia do podmenu)
+│   │   - w trybie AUTO: rotorem steruje aplikacja nadrzędna (Serial USB lub TCP/IP)
+│   │   - w trybie MANUAL: cel ustawiany enkoderem
+│   │
+│   ├─> [1] ROTOR SET - Ustawienia rotora
+│   │   │
+│   │   ├─> [0] PAN - Maksymalny kąt obrotu (0-365°)
+│   │   │   └─> Ustaw wartość enkoderem, zapisz kliknięciem
+│   │   │
+│   │   ├─> [1] TILT - Maksymalny kąt elewacji (0-90°)
+│   │   │   └─> Ustaw wartość enkoderem, zapisz kliknięciem
+│   │   │
+│   │   ├─> [2] SPEED - Prędkość komunikacji RS485
+│   │   │   └─> Przełącz między 2400/9600 bps, zapisz kliknięciem
+│   │   │
+│   │   ├─> [3] DIR - Kierunek geograficzny pozycji 0 (0-359°)
+│   │   │   └─> Ustaw wartość enkoderem, zapisz kliknięciem
+│   │   │
+│   │   ├─> [4] PAN SCALE - Skala pozioma (Normal/Reverse)
+│   │   │   └─> Wybierz Normal lub Reverse, zapisz kliknięciem
+│   │   │
+│   │   └─> [5] TILT SCALE - Skala pionowa (Normal/Reverse)
+│   │       └─> Wybierz Normal lub Reverse, zapisz kliknięciem
+│   │       * Jeśli pozycja 0 = północ → ustaw 0°
+│   │       * Jeśli pozycja 0 = południe → ustaw 180°
+│   │       * Jeśli pozycja 0 = wschód → ustaw 90°
+│   │       * Jeśli pozycja 0 = zachód → ustaw 270°
+│   │
+│   ├─> [2] KALIB AZ - Kalibracja azymutu
+│   │   └─> Proces kalibracji:
+│   │       1. Silnik obraca w lewo
+│   │       2. Kliknij gdy osiągnie MAXLEFT
+│   │       3. Silnik obraca w prawo
+│   │       4. Kliknij gdy osiągnie MAXRIGHT
+│   │       5. System oblicza czas obrotu na stopień
+│   │
+│   ├─> [3] KALIB EL - Kalibracja elewacji
+│   │   └─> Proces kalibracji:
+│   │       1. Silnik obraca w dół
+│   │       2. Kliknij gdy osiągnie MAXDOWN
+│   │       3. Silnik obraca w górę
+│   │       4. Kliknij gdy osiągnie MAXUP
+│   │       5. System oblicza czas obrotu na stopień
+│   │
+│   ├─> [4] ALARMY - Lista aktywnych alarmów
+│   │   └─> Wyświetla ostrzeżenia systemowe (np. brak kalibracji)
+│   │
+│   ├─> [5] INFO - Informacje o systemie
+│   │   └─> Wyświetla:
+│   │       - TR_AZ (czas obrotu o 1° w azymucie w ms/°)
+│   │       - TR_EL (czas obrotu o 1° w elewacji w ms/°)
+│   │       - PAN, TILT (parametry rotora)
+│   │       - SPD (prędkość komunikacji RS485)
+│   │       - DIR (kierunek geograficzny pozycji 0)
+│   │       - IP (adres IP urządzenia - WiFi lub AP)
+│   │
+│   └─> [6] REMOTE CTRL - Wybór trybu komunikacji zdalnej
+│       │
+│       ├─> [0] USBSERIAL - Komendy przez Serial USB (port COM)
+│       │   └─> Kliknij aby wybrać: Serial USB obsługuje protokół GS-232A
+│       │       - Port USB działa jako interfejs GS-232A (bez logów debug)
+│       │       - Prędkość: 57600 bps
+│       │       - Użyj portu COM w programach (Orbitron, Gpredict, SatPC32)
+│       │
+│       └─> [1] TCPIP - Komendy przez WiFi TCP/IP
+│           └─> Kliknij aby wybrać: ESP32 obsługuje protokół rotctld/Hamlib
+│               - WiFi próbuje połączyć z siecią domową (jeśli skonfigurowana)
+│               - Jeśli nie może połączyć się z siecią domową → tworzy AP
+│               - SSID AP: "ROTORSP3KON" (bez hasła)
+│               - IP: 192.168.4.1 (AP) lub IP z sieci domowej
+│               - Port TCP: 4533 (standardowy dla Hamlib rotctld)
+│               - Strona WWW: http://IP_urządzenia (konfiguracja parametrów)
+│               - Kompatybilne z SkyROOF, Tucnak (Remote rotator)
+
+NAWIGACJA:
+----------
+- Krótkie kliknięcie przycisku: wejście do menu / akcja
+- Długie kliknięcie (>400ms): powrót do poprzedniego menu
+- Enkoder: nawigacja w menu / zmiana wartości
+- W trybie ręcznym (MAN): enkoder bezpośrednio steruje silnikiem
+
+================================================================================
+
+3. INSTRUKCJA OBSŁUGI
+================================================================================
+
+KROK 1: PIERWSZE URUCHOMIENIE
+------------------------------
+1. Podłącz wszystkie moduły zgodnie z schematem podłączeń
+2. Zasil system (3.3V/5V)
+3. Na ekranie pojawi się ekran główny z aktualną pozycją
+
+KROK 2: KONFIGURACJA ROTORA (ROTOR SETTINGS)
+---------------------------------------------
+1. Z menu głównego wybierz "ROTOR SET"
+2. Ustaw parametry:
+   - PAN: maksymalny kąt obrotu poziomego (np. 365°)
+   - TILT: maksymalny kąt elewacji (np. 90°)
+   - SPEED: prędkość komunikacji z rotorem (2400 lub 9600 bps)
+   - DIR: kierunek geograficzny pozycji 0
+     * Jeśli pozycja 0 = północ → ustaw 0°
+     * Jeśli pozycja 0 = południe → ustaw 180°
+     * Jeśli pozycja 0 = wschód → ustaw 90°
+     * Jeśli pozycja 0 = zachód → ustaw 270°
+3. Każdą wartość zapisz kliknięciem przycisku
+
+KROK 3: KALIBRACJA AZYMUTU (KALIB AZ)
+--------------------------------------
+1. Z menu głównego wybierz "KALIB AZ"
+2. System rozpocznie obrót w lewo
+3. Gdy rotor osiągnie maksymalną pozycję w lewo (MAXLEFT):
+   - Kliknij przycisk enkodera
+4. System rozpocznie obrót w prawo
+5. Gdy rotor osiągnie maksymalną pozycję w prawo (MAXRIGHT):
+   - Kliknij przycisk enkodera
+6. System obliczy czas obrotu na stopień (TR1D_AZ)
+7. Rotor ustawi się na pozycję 0
+
+KROK 4: KALIBRACJA ELEWACJI (KALIB EL)
+--------------------------------------
+1. Z menu głównego wybierz "KALIB EL"
+2. System rozpocznie obrót w dół
+3. Gdy rotor osiągnie maksymalną pozycję w dół (MAXDOWN):
+   - Kliknij przycisk enkodera
+4. System rozpocznie obrót w górę
+5. Gdy rotor osiągnie maksymalną pozycję w górę (MAXUP):
+   - Kliknij przycisk enkodera
+6. System obliczy czas obrotu na stopień (TR1D_EL)
+7. Rotor ustawi się na pozycję 0
+
+KROK 5: UŻYWANIE SYSTEMU
+--------------------------
+TRYB AUTOMATYCZNY (AUTO):
+- System automatycznie pozycjonuje rotor do ustawionego celu
+- Cel można ustawić przez:
+  * Serial USB (protokół GS-232A: "MXXX" gdzie XXX to azymut 0-359°)
+  * TCP/IP (protokół rotctld/Hamlib: "P az el")
+  * Menu (w trybie ręcznym ustaw targetAZ przez enkoder)
+- LED miga podczas pozycjonowania
+- LED gaśnie gdy cel osiągnięty
+- Mechanizm zabezpieczający: jeśli rotor nie może osiągnąć celu (oscylacje),
+  po 3 próbach zatrzymuje się na pozycji najbliższej do celu
+
+TRYB RĘCZNY (MAN):
+- Enkoder bezpośrednio steruje silnikiem
+- Kręcenie enkoderem = obrót rotora
+- Po zatrzymaniu enkodera silnik się zatrzymuje
+
+KOMUNIKACJA KOMPUTER - STEROWNIK:
+----------------------------------
+Sterownik obsługuje dwa protokoły komunikacji:
+1. Yaesu GS-232A - dla Serial USB (port COM)
+2. rotctld/Hamlib - dla TCP/IP (WiFi)
+
+TRYBY KOMUNIKACJI ZDALNEJ (Menu → REMOTE CTRL):
+------------------------------------------------
+1. USBSERIAL - Komunikacja przez Serial USB (port COM)
+   - Protokół: Yaesu GS-232A (100% zgodny)
+   - Logi debug są wyłączone (tylko sterowanie)
+   - Użycie: 
+     * Orbitron, Gpredict, SatPC32, HRD → Port COM (USB Serial)
+     * Model Rotora: Yaesu GS-232A
+   
+   USTAWIENIA:
+   - Port: Numer portu COM przypisany do ESP32 (USB)
+   - Prędkość (Baud): 57600 bps
+   - Bity danych: 8
+   - Bity stopu: 1
+   - Parzystość: None
+
+   OBSŁUGIWANE KOMENDY (GS-232A):
+   - "C" lub "C2" - Odczyt pozycji (zwraca "AZ=XXX EL=YY\r\n")
+   - "Waaa eee"    - Ustaw AZ (aaa) i EL (eee) naraz (np. "W120 045")
+   - "Maaa"        - Ustaw tylko AZ (np. "M090")
+   - "Beee"        - Ustaw tylko EL (np. "B030")
+   - "S"           - Stop wszystko
+   - "A"           - Stop Azimuth
+   - "E"           - Stop Elevation
+   - "L"           - Obrót w lewo (Manual)
+   - "R"           - Obrót w prawo (Manual)
+   - "U"           - Obrót w górę (Manual)
+   - "D"           - Obrót w dół (Manual)
+
+2. TCPIP - Komunikacja przez WiFi TCP/IP
+   - Protokół: rotctld/Hamlib (standardowy protokół Hamlib)
+   - ESP32 próbuje połączyć z siecią domową (jeśli skonfigurowana w menu INFO WWW)
+   - Jeśli nie może połączyć się z siecią domową → tworzy Access Point
+   - Serwer TCP na porcie 4533 (standardowy port Hamlib rotctld)
+   - Strona WWW: http://IP_urządzenia (konfiguracja parametrów i WiFi)
+   - Kompatybilne z SkyROOF, Tucnak (Remote rotator)
+   
+   USTAWIENIA:
+   - Tryb WiFi: AP (SSID: "ROTORSP3KON", bez hasła) lub połączenie z siecią domową
+   - IP: 192.168.4.1 (AP) lub IP z sieci domowej (sprawdź w Serial Monitor lub menu INFO)
+   - Port TCP: 4533
+   - Strona WWW: http://IP_urządzenia (port 80)
+   
+   KONFIGURACJA W SKYROOF:
+   - Wybierz typ rotora: rotctld (TCP/IP)
+   - Host: 192.168.4.1 (lub IP z sieci domowej)
+   - Port: 4533
+   
+   KONFIGURACJA W TUCNAC:
+   - Rotator options → Remote rotator
+   - Host: 192.168.4.1 (lub IP z sieci domowej)
+   - Port: 4533
+
+   OBSŁUGIWANE KOMENDY (rotctld/Hamlib):
+   - "p" lub "\get_pos" - Odczyt pozycji (zwraca dwie linie: az\nel\n)
+   - "+\get_pos"        - Odczyt pozycji Extended Response (zwraca "get_pos:\nAzimuth: X\nElevation: Y\nRPRT 0\n")
+   - "P az el" lub "\set_pos az el" - Ustaw pozycję (np. "P0.4 45.4")
+   - "S" lub "\stop"    - Stop wszystko
+
+WAŻNE: Aby sterowanie z komputera działało, sterownik musi być w trybie AUTO.
+
+================================================================================
+
+4. TROUBLESHOOTING
+================================================================================
+
+PROBLEM: Wyświetlacz nie działa
+ROZWIĄZANIE:
+- Sprawdź połączenia I2C (SDA/SCL)
+- Sprawdź zasilanie 3.3V
+- Sprawdź adres I2C (domyślnie 0x3C)
+- Sprawdź czy wyświetlacz jest typu SSD1306 128x64
+
+PROBLEM: Enkoder nie reaguje
+ROZWIĄZANIE:
+- Sprawdź połączenia (piny 32, 33, 27)
+- Sprawdź zasilanie 3.3V
+- Piny 32 i 33 mają wbudowane pull-up, nie wymagają zewnętrznych rezystorów
+
+PROBLEM: Rotor nie reaguje na komendy
+ROZWIĄZANIE:
+- Sprawdź połączenia RS485 (piny 13, 14)
+- Sprawdź prędkość komunikacji w ROTOR SETTINGS (2400/9600 bps)
+- Sprawdź zasilanie modułu RS485
+- Sprawdź połączenie z rotorem (A/B, GND)
+
+PROBLEM: Kalibracja nie działa poprawnie
+ROZWIĄZANIE:
+- Upewnij się, że klikasz przycisk dokładnie w pozycji MAXLEFT/MAXRIGHT
+- Sprawdź czy parametry PAN i TILT są ustawione poprawnie
+- Wykonaj kalibrację ponownie
+
+PROBLEM: Pozycja jest nieprawidłowa
+ROZWIĄZANIE:
+- Sprawdź ustawienie Direction w ROTOR SETTINGS
+- Wykonaj ponowną kalibrację
+- Sprawdź czy parametry PAN i TILT odpowiadają rzeczywistemu zakresowi rotora
+
+PROBLEM: Rotor oscyluje i nie może osiągnąć celu
+ROZWIĄZANIE:
+- System ma wbudowany mechanizm zabezpieczający przed oscylacjami
+- Po 3 próbach przekroczenia celu, rotor zatrzymuje się na pozycji najbliższej do celu
+- Sprawdź kalibrację (TR1D_AZ, TR1D_EL) - może wymagać poprawy
+- Sprawdź czy parametry PAN i TILT odpowiadają rzeczywistemu zakresowi rotora
+
+PROBLEM: Komunikacja TCP/IP nie działa
+ROZWIĄZANIE:
+- Sprawdź czy tryb REMOTE CTRL → TCPIP jest wybrany w menu
+- Sprawdź czy komputer jest połączony z siecią WiFi "ROTORSP3KON"
+- Sprawdź IP ESP32 w Serial Monitor (powinno być 192.168.4.1)
+- Sprawdź port 4533 (nie powinien być zablokowany przez firewall)
+- W SkyROOF: sprawdź ustawienia rotctld (Host, Port)
+
+PROBLEM: Serial USB nie odpowiada na komendy
+ROZWIĄZANIE:
+- Sprawdź czy tryb REMOTE CTRL → USBSERIAL jest wybrany w menu
+- Sprawdź port COM w Menedżerze urządzeń
+- Sprawdź prędkość transmisji (57600 bps dla Serial)
+- W trybie USBSERIAL logi debug są wyłączone (to normalne)
+
+================================================================================
+
+5. PARAMETRY DOMYŚLNE
+================================================================================
+
+PAN_MAX:        365° (maksymalny kąt obrotu poziomego)
+TILT_MAX:       90°  (maksymalny kąt elewacji)
+commSpeed:      2400 bps (prędkość komunikacji RS485)
+direction:      0°   (pozycja 0 = północ geograficzna)
+
+Wszystkie parametry są zapisywane w pamięci EEPROM i wczytują się automatycznie
+przy starcie systemu.
+
+================================================================================
+
+6. ZAKRESY I OGRANICZENIA
+================================================================================
+
+AZYMUT (PAN):
+- Wewnętrzna pozycja: 0 do PAN_MAX (domyślnie 0-365°)
+- Azymut geograficzny: 0-359° (0°=północ, 90°=wschód, 180°=południe, 270°=zachód)
+- Precyzja: zależy od kalibracji (TR1D_AZ)
+
+ELEWACJA (TILT):
+- Zakres: 0 do TILT_MAX (domyślnie 0-90°)
+- Precyzja: zależy od kalibracji (TR1D_EL)
+
+KOMUNIKACJA:
+- RS485: 2400 lub 9600 bps (komunikacja z rotorem, protokół Pelco-D adres 1)
+- Serial USB: 57600 bps (tryb USBSERIAL, protokół GS-232A)
+- WiFi TCP/IP: Port 4533 (tryb TCPIP, protokół rotctld/Hamlib)
+- WiFi: Próba połączenia z siecią domową → AP (SSID: "ROTORSP3KON")
+- Strona WWW: http://IP_urządzenia (port 80) - konfiguracja parametrów i WiFi
+- Protokół sterowania Serial USB: Yaesu GS-232A (100% kompatybilny)
+- Protokół sterowania TCP/IP: rotctld/Hamlib (standard Hamlib)
+
+================================================================================
+
+KONTAKT I WSPARCIE
+================================================================================
+
+W przypadku problemów sprawdź:
+1. Połączenia elektryczne
+2. Zasilanie wszystkich modułów
+3. Ustawienia w menu ROTOR SETTINGS
+4. Poprawność kalibracji
+
+Wersja oprogramowania: 3.2
+Kompatybilność: ESP32 WROOM-32, WROVER-E, DevKitC
+
+NOWE FUNKCJE W WERSJI 3.2:
+---------------------------
+- Automatyczne bazowanie (homing) do pozycji 0/0 po uruchomieniu urządzenia
+- Menu REMOTE CTRL - wybór trybu komunikacji zdalnej
+- Tryb USBSERIAL - sterowanie przez Serial USB (port COM, protokół GS-232A)
+- Tryb TCPIP - sterowanie przez WiFi TCP/IP (port 4533, protokół rotctld/Hamlib)
+  * Kompatybilny z SkyROOF (rotctld)
+  * Kompatybilny z Tucnak (Remote rotator)
+- WiFi: Automatyczne połączenie z siecią domową lub tworzenie AP
+- Strona WWW: Konfiguracja parametrów rotora i WiFi przez przeglądarkę
+- Mechanizm zabezpieczający przed oscylacjami (3 próby)
+- Odwrócenie skali PAN/TILT w menu (Normal/Reverse)
+- Rozdzielenie protokołów: GS-232A (Serial USB) / rotctld (TCP/IP)
+- Menu INFO wyświetla adres IP urządzenia
+
+================================================================================
+
+================================================================================

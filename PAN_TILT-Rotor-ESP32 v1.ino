@@ -1,0 +1,2122 @@
+/* * UNIWERSALNY STEROWNIK ROTORA SP3KON v3.2
+ * Kompatybilność: WROVER-E, WROOM-32, DevKitC
+ * System oparty na czasie obrotu (bez kompasu)
+ * 
+ * SYSTEM AZYMUTU:
+ * - Wewnętrzna pozycja: 0 do PAN_MAX (ustawiany w menu ROTOR SETTINGS, domyślnie 0-365°)
+ * - Azymut geograficzny: 0-359° (0° = północ, 90° = wschód, 180° = południe, 270° = zachód)
+ * - Direction: ustawiany w menu ROTOR SETTINGS - wskazuje jaki kierunek geograficzny odpowiada pozycji 0
+ * - Przykład: jeśli pozycja 0 jest skierowana na południe, ustaw Direction = 180°
+ * 
+ * PARAMETRY ROTORA (menu ROTOR SETTINGS):
+ * - PAN: maksymalny kąt obrotu poziomego (0-365°)
+ * - TILT: maksymalny kąt elewacji (0-90°)
+ * - Communication Speed: prędkość komunikacji RS485 (2400 lub 9600 bps)
+ * - Direction: kierunek geograficzny pozycji 0 (0-359°)
+ * 
+ * UWAGI DLA ESP32 WROOM:
+ * - Enkoder na pinach 32/33 z wbudowanymi pull-upami
+ * - Serial2 na pinach 13/14 jest bezpieczny
+ * - WiFi: próbuje połączyć z siecią domową, jeśli nie może - tworzy AP
+ */
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <ESP32Encoder.h>
+#include <Preferences.h>
+
+// Port TCP dla komunikacji GS-232A (standardowy dla rotctld/Hamlib)
+#define TCP_PORT 4533
+// Port HTTP dla strony WWW
+#define HTTP_PORT 80
+
+// --- BEZPIECZNA KONFIGURACJA PINÓW ---
+const int PIN_LED    = 2;   // Wbudowana LED ESP32 WROOM (GPIO 2)  a docelowo dodać na innym pinie dla kontroli pracy rotora 
+const int PIN_ENC_SW = 27;  // Przycisk enkodera (z pull-up)
+const int PIN_ENC_A  = 32;  // Enkoder A (z pull-up)
+const int PIN_ENC_B  = 33;  // Enkoder B (z pull-up)  
+const int RS485_RX   = 13;  
+const int RS485_TX   = 14;  
+const int I2C_SDA    = 21;  
+const int I2C_SCL    = 22;  
+
+// --- Debounce / krok enkodera ---
+// ESP32Encoder (PCNT) potrafi liczyć kilka "countów" na jeden klik (detent) i może zbierać drgania.
+// Dla typowego enkodera mechanicznego przy attachHalfQuad zwykle wychodzi ~2 county / 1 klik.
+const int ENCODER_COUNTS_PER_STEP = 2;         // ile countów = 1 krok w menu (dostosuj jeśli trzeba: 1/2/4)
+const uint16_t ENCODER_STEP_MIN_INTERVAL_MS = 2; // minimalny odstęp czasowy między krokami (filtr drgań)
+const uint16_t BTN_DEBOUNCE_MS = 30;           // debounce przycisku enkodera (SW)
+
+// --- Obiekty ---
+WiFiServer tcpServer(TCP_PORT);
+WiFiClient tcpClient;
+WebServer webServer(HTTP_PORT);
+Adafruit_SSD1306 display(128, 64, &Wire, -1);
+ESP32Encoder encoder;
+Preferences prefs;
+
+// --- Zmienne ---
+// bool hasPSRAM = false;  // Usunięto - nie potrzebne
+bool isAutoMode = false;
+
+// Tryby komunikacji zdalnej
+enum RemoteCtrlMode {
+  REMOTE_NONE = 0,
+  REMOTE_USBSERIAL = 1,
+  REMOTE_TCPIP = 2
+};
+
+RemoteCtrlMode remoteCtrlMode = REMOTE_NONE;
+
+enum MenuState { 
+  MAIN_SCR, MENU_ROOT, ROTOR_SETTINGS, 
+  SET_PAN, SET_TILT, SET_COMM_SPEED, SET_DIRECTION,
+  SET_PAN_DIR, SET_TILT_DIR,
+  CALIB_AZ_CONFIRM, CALIB_EL_CONFIRM,
+  CALIB_AZ_LEFT, CALIB_AZ_RIGHT, CALIB_EL_DOWN, CALIB_EL_UP,
+  INFO_SCR, ALARMS_MENU,
+  REMOTE_CTRL, REMOTE_CTRL_SELECT
+};
+
+enum AlarmType {
+  ALARM_NONE = 0,
+  ALARM_NO_CALIBRATION = 1,
+  ALARM_MOTOR_ERROR = 2,
+  ALARM_COMM_ERROR = 3
+};
+
+MenuState currentMenu = MAIN_SCR;
+int menuIdx = 0;
+int rotorMenuIdx = 0;  // Indeks w menu ROTOR SETTINGS
+int alarmMenuIdx = 0;  // Indeks w menu ALARMS
+int remoteMenuIdx = 0;  // Indeks w menu REMOTE_CTRL (0=USBSERIAL, 1=TCPIP)
+
+// Parametry rotora
+int PAN_MAX = 365;        // Maksymalny kąt obrotu PAN (0-365°)
+int TILT_MAX = 90;       // Maksymalny kąt elewacji TILT (0-90°)
+int commSpeed = 2400;    // Prędkość komunikacji (2400 lub 9600 bps)
+int direction = 0;       // Kierunek geograficzny pozycji 0 (0-359°)
+bool reversePAN = false; // Odwrócenie logiki PAN
+bool reverseTILT = false;// Odwrócenie logiki TILT
+
+// Parametry WiFi
+char wifiSSID[32] = "";  // SSID sieci domowej
+char wifiPassword[64] = "";  // Hasło sieci domowej
+bool wifiConnected = false;  // Status połączenia WiFi
+
+// Parametry kalibracji
+float TR1D_AZ = 0.0;  // Czas obrotu o 1 stopień AZ (ms)
+float TR1D_EL = 0.0;  // Czas obrotu o 1 stopień EL (ms)
+bool isCalibrated = false;
+
+// Pozycje (używają PAN_MAX i TILT_MAX jako zakresów)
+int currentAZ = 0;  // 0 do PAN_MAX
+int targetAZ = 0;
+int currentEL = 0;  // 0 do TILT_MAX
+int targetEL = 0;
+
+// Śledzenie czasu obrotu
+unsigned long motorStartTime = 0;
+bool motorRunning = false;
+int motorDirection = 0;  // -1 lewo/dół, 0 stop, 1 prawo/góra
+bool motorIsAZ = true;   // true=AZ, false=EL
+
+// Mechanizm zabezpieczający przed oscylacjami przy osiąganiu celu
+struct OscillationProtection {
+  int attemptCount;        // Liczba prób osiągnięcia celu
+  int lastDirection;       // Ostatni kierunek ruchu (-1, 0, 1)
+  int bestPosition;        // Najlepsza pozycja osiągnięta (najbliższa celowi)
+  int bestDiff;            // Najlepsza różnica od celu
+  int lastTargetAZ;        // Ostatni cel AZ (do wykrywania zmiany celu)
+  int lastTargetEL;        // Ostatni cel EL
+} oscProtectAZ = {0, 0, 0, 9999, -1, -1};
+OscillationProtection oscProtectEL = {0, 0, 0, 9999, -1, -1};
+
+// System alarmów - deklaracje
+#define MAX_ALARMS 4
+struct Alarm {
+  AlarmType type;
+  bool active;
+  const char* message;
+};
+Alarm alarms[MAX_ALARMS] = {
+  {ALARM_NO_CALIBRATION, false, "BRAK KALIBRACJI"},
+  {ALARM_MOTOR_ERROR, false, "BLAD SILNIKA"},
+  {ALARM_COMM_ERROR, false, "BLAD KOMUNIKACJI"},
+  {ALARM_NONE, false, ""}
+};
+
+// Powiadomienia na wyświetlaczu (jednorazowe)
+bool notificationActive = false;
+const char* notificationMessage = "";
+unsigned long notificationStartTime = 0;
+unsigned long lastAutoNotificationTime = 0; // Czas ostatniego powiadomienia o trybie AUTO
+
+// Funkcje systemu alarmów (po deklaracjach zmiennych)
+void showNotification(const char* msg) {
+  notificationActive = true;
+  notificationMessage = msg;
+  notificationStartTime = millis();
+}
+
+void setAlarm(AlarmType type, bool active) {
+  for (int i = 0; i < MAX_ALARMS - 1; i++) {
+    if (alarms[i].type == type) {
+      if (alarms[i].active != active) {
+        alarms[i].active = active;
+        if (active) {
+          Serial.printf("[ALARM] %s - AKTYWNY\n", alarms[i].message);
+          showNotification(alarms[i].message);
+        } else {
+          Serial.printf("[ALARM] %s - WYLACZONY\n", alarms[i].message);
+        }
+      }
+      return;
+    }
+  }
+}
+
+void checkAlarms() {
+  // Sprawdź brak kalibracji
+  setAlarm(ALARM_NO_CALIBRATION, !isCalibrated);
+  
+  // Tutaj można dodać inne sprawdzenia alarmów
+  // setAlarm(ALARM_MOTOR_ERROR, ...);
+  // setAlarm(ALARM_COMM_ERROR, ...);
+}
+
+// Ramki Pelco-D (Adres 1)
+byte pStop[]     = {0xFF, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01};
+byte pRight[]    = {0xFF, 0x01, 0x00, 0x02, 0x20, 0x00, 0x23};
+byte pLeft[]     = {0xFF, 0x01, 0x00, 0x04, 0x20, 0x00, 0x25};
+byte pUp[]       = {0xFF, 0x01, 0x00, 0x08, 0x00, 0x20, 0x29};
+byte pDown[]     = {0xFF, 0x01, 0x00, 0x10, 0x00, 0x20, 0x31};
+byte pQueryPan[] = {0xFF, 0x01, 0x00, 0x51, 0x00, 0x00, 0x52}; // Zapytanie o pozycję AZ
+
+unsigned long lastCommCheck = 0;
+const unsigned long commCheckInterval = 5000; // Sprawdzaj co 5 sekund
+
+void sendPelco(byte cmd[]) {
+  Serial2.write(cmd, 7);
+  // Logowanie ramek Pelco na Serial (debug)
+  // for(int i=0; i<7; i++) Serial.printf("%02X ", cmd[i]);
+  // Serial.println();
+}
+
+// Funkcja sprawdzająca komunikację z rotorem (Ping) - całkowicie wyciszona
+void checkRotorComm() {
+  // Funkcja wyłączona - rotory CCTV nie posiadają nadajnika RS485 (tryb Listen Only)
+  setAlarm(ALARM_COMM_ERROR, false); 
+  return; 
+}
+
+void stopMotor() {
+  sendPelco(pStop);
+  motorRunning = false;
+  motorDirection = 0;
+}
+
+void startMotor(int direction, bool isAZ) {
+  // Nie wysyłaj w kółko tej samej komendy (oszczędza RS485 i stabilizuje zliczanie czasu)
+  if (motorRunning && motorIsAZ == isAZ && motorDirection == direction) {
+    return;
+  }
+  motorIsAZ = isAZ;
+  motorDirection = direction;
+  motorStartTime = millis();
+  motorRunning = true;
+  
+  if (isAZ) {
+    if (direction > 0) sendPelco(pRight);
+    else sendPelco(pLeft);
+  } else {
+    if (direction > 0) sendPelco(pUp);
+    else sendPelco(pDown);
+  }
+}
+
+// Konwersja wewnętrznej pozycji na azymut geograficzny (0-359)
+int getGeographicAzimuth() {
+  // Jeśli reverse, odwróć skalę wewnętrzną (PAN_MAX - current)
+  int physAZ = reversePAN ? (PAN_MAX - currentAZ) : currentAZ;
+  int geoAZ = (physAZ + direction) % 360;
+  if (geoAZ < 0) geoAZ += 360;
+  return geoAZ;
+}
+
+// Pobierz aktualną elewację dla użytkownika (z uwzględnieniem reverse)
+int getUserElevation() {
+  return reverseTILT ? (TILT_MAX - currentEL) : currentEL;
+}
+
+// Konwersja azymutu geograficznego na wewnętrzną pozycję (0-PAN_MAX)
+int geographicToInternal(int geoAZ) {
+  // Oblicz dystans geograficzny od punktu DIR
+  int dist = (geoAZ - direction + 360) % 360;
+  
+  // Jeśli rotor ma zakładkę (PAN_MAX > 360), sprawdź czy cel jest w zakładce
+  if (PAN_MAX > 360) {
+    if (dist + 360 <= PAN_MAX) {
+      // Wybieramy opcję bliższą obecnej pozycji (uwzględniając ewentualne reverse później)
+      int opt1 = reversePAN ? (PAN_MAX - dist) : dist;
+      int opt2 = reversePAN ? (PAN_MAX - (dist + 360)) : (dist + 360);
+      if (abs(opt2 - currentAZ) < abs(opt1 - currentAZ)) {
+        dist += 360;
+      }
+    }
+  }
+  
+  return reversePAN ? (PAN_MAX - dist) : dist;
+}
+
+// Konwersja elewacji użytkownika na wewnętrzną pozycję (0-TILT_MAX)
+int userToInternalEL(int userEL) {
+  int val = reverseTILT ? (TILT_MAX - userEL) : userEL;
+  return constrain(val, 0, TILT_MAX);
+}
+
+// Konwersja wewnętrznej pozycji (np. targetAZ) na azymut geograficzny (0-359)
+int internalToGeographic(int internalAz) {
+  int physAZ = reversePAN ? (PAN_MAX - internalAz) : internalAz;
+  int geoAZ = (physAZ + direction) % 360;
+  if (geoAZ < 0) geoAZ += 360;
+  return geoAZ;
+}
+
+void updatePosition() {
+  if (!motorRunning || !isCalibrated) return;
+  
+  unsigned long elapsed = millis() - motorStartTime;
+  
+  if (motorIsAZ && TR1D_AZ > 0) {
+    int degreesMoved = (int)(elapsed / TR1D_AZ);
+    if (degreesMoved > 0) {
+      if (motorDirection > 0) {
+        currentAZ = min(PAN_MAX, currentAZ + degreesMoved);
+      } else {
+        currentAZ = max(0, currentAZ - degreesMoved);
+      }
+      motorStartTime = millis();  // Reset timer
+      prefs.putInt("currentAZ", currentAZ);  // Zapisz pozycję
+    }
+  } else if (!motorIsAZ && TR1D_EL > 0) {
+    int degreesMoved = (int)(elapsed / TR1D_EL);
+    if (degreesMoved > 0) {
+      if (motorDirection > 0) {
+        currentEL = min(TILT_MAX, currentEL + degreesMoved);
+      } else {
+        currentEL = max(0, currentEL - degreesMoved);
+      }
+      motorStartTime = millis();  // Reset timer
+      prefs.putInt("currentEL", currentEL);  // Zapisz pozycję
+    }
+  }
+}
+
+// Obsługa komend GS-232A/B (tylko dla Serial USB)
+void handleGs232Command(char* cmd, int len, Stream* output, bool logSerial) {
+  // Usuń białe znaki na końcu
+  while (len > 0 && (cmd[len-1] == '\r' || cmd[len-1] == '\n' || cmd[len-1] == ' ')) {
+    cmd[--len] = '\0';
+  }
+  if (len <= 0) return;
+
+  if (logSerial) {
+    Serial.printf("[GS232 RX] %s\n", cmd);
+  }
+
+  if ((cmd[0] == 'C' && len == 1) || (cmd[0] == 'C' && cmd[1] == '2' && len == 2)) {
+    // Zwróć azymut geograficzny (0-359) i elewację (Standard Yaesu GS-232A/B)
+    int geoAZ = getGeographicAzimuth();
+    int userEL = getUserElevation();
+    char resp[32];
+    snprintf(resp, sizeof(resp), "AZ=%03d EL=%02d\r\n", geoAZ, userEL);
+    if (output) output->print(resp);
+    if (logSerial) Serial.printf("[GS232 TX] %s", resp);
+  } else if (cmd[0] == 'M' && len > 1) {
+    // Komenda Maaa - ustaw Azymut (000-359)
+    int val = atoi(&cmd[1]);
+    if (val >= 0 && val <= 359) {
+      if (isAutoMode) {
+        targetAZ = geographicToInternal(val);
+      } else {
+        if (millis() - lastAutoNotificationTime > 30000) {
+          showNotification("PRZELACZ NA AUTO!");
+          lastAutoNotificationTime = millis();
+        }
+      }
+    }
+  } else if (cmd[0] == 'B' && len > 1) {
+    // Komenda Beee - ustaw Elewację (000-090)
+    int val = atoi(&cmd[1]);
+    if (val >= 0 && val <= 90) {
+      if (isAutoMode) {
+        targetEL = userToInternalEL(val);
+      } else {
+        if (millis() - lastAutoNotificationTime > 30000) {
+          showNotification("PRZELACZ NA AUTO!");
+          lastAutoNotificationTime = millis();
+        }
+      }
+    }
+  } else if (cmd[0] == 'W' && len >= 7) {
+    // Komenda Waaa eee - ustaw Azymut i Elewację
+    int az, el;
+    // Format Waaa eee (np. W120 045)
+    if (sscanf(cmd, "W%d %d", &az, &el) == 2) {
+      if (isAutoMode) {
+        targetAZ = geographicToInternal(az % 360);
+        targetEL = userToInternalEL(el);
+      } else {
+        if (millis() - lastAutoNotificationTime > 30000) {
+          showNotification("PRZELACZ NA AUTO!");
+          lastAutoNotificationTime = millis();
+        }
+      }
+    }
+  } else if (cmd[0] == 'S' && len == 1) {
+    // Komenda S - Stop wszystko
+    if (isAutoMode) {
+      targetAZ = currentAZ;
+      targetEL = currentEL;
+      stopMotor();
+    }
+  } else if (cmd[0] == 'A' && len == 1) {
+    // Komenda A - Stop Azymut
+    if (isAutoMode) {
+      targetAZ = currentAZ;
+      if (motorRunning && motorIsAZ) stopMotor();
+    }
+  } else if (cmd[0] == 'E' && len == 1) {
+    // Komenda E - Stop Elewacja
+    if (isAutoMode) {
+      targetEL = currentEL;
+      if (motorRunning && !motorIsAZ) stopMotor();
+    }
+  } else if (cmd[0] == 'L' && len == 1) {
+    // Komenda L - Obrót w lewo (manualny start z PC)
+    if (isAutoMode) startMotor(-1, true);
+    else {
+      if (millis() - lastAutoNotificationTime > 30000) {
+        showNotification("PRZELACZ NA AUTO!");
+        lastAutoNotificationTime = millis();
+      }
+    }
+  } else if (cmd[0] == 'R' && len == 1) {
+    // Komenda R - Obrót w prawo
+    if (isAutoMode) startMotor(1, true);
+    else {
+      if (millis() - lastAutoNotificationTime > 30000) {
+        showNotification("PRZELACZ NA AUTO!");
+        lastAutoNotificationTime = millis();
+      }
+    }
+  } else if (cmd[0] == 'U' && len == 1) {
+    // Komenda U - Obrót w górę
+    if (isAutoMode) startMotor(1, false);
+    else {
+      if (millis() - lastAutoNotificationTime > 30000) {
+        showNotification("PRZELACZ NA AUTO!");
+        lastAutoNotificationTime = millis();
+      }
+    }
+  } else if (cmd[0] == 'D' && len == 1) {
+    // Komenda D - Obrót w dół
+    if (isAutoMode) startMotor(-1, false);
+    else {
+      if (millis() - lastAutoNotificationTime > 30000) {
+        showNotification("PRZELACZ NA AUTO!");
+        lastAutoNotificationTime = millis();
+      }
+    }
+  }
+}
+
+// Obsługa komend rotctld/Hamlib (tylko dla TCP/IP)
+void handleRotctldCommand(char* cmd, int len, Stream* output, bool logSerial) {
+  // Usuń białe znaki na końcu
+  while (len > 0 && (cmd[len-1] == '\r' || cmd[len-1] == '\n' || cmd[len-1] == ' ' || cmd[len-1] == '\t')) {
+    cmd[--len] = '\0';
+  }
+  if (len <= 0) return;
+
+  // Zamień przecinki na kropki (obsługa różnych lokalizacji oprogramowania PC)
+  for (int i = 0; i < len; i++) {
+    if (cmd[i] == ',') cmd[i] = '.';
+  }
+
+  if (logSerial) {
+    Serial.printf("[ROTCTLD RX] %s\n", cmd);
+  }
+
+  bool extendedResponse = false;
+  char* actualCmd = cmd;
+
+  // Sprawdź czy jest prefiks Protocol (+, ;, |, \)
+  if (len > 0 && (cmd[0] == '+' || cmd[0] == ';' || cmd[0] == '|' || cmd[0] == '\\')) {
+    // Jeśli prefiks to '+', ';', '|' -> włącz tryb Extended
+    if (cmd[0] != '\\') extendedResponse = true;
+    
+    actualCmd = &cmd[1];
+    len--;
+  }
+
+  // Komenda get_pos: p lub \get_pos
+  if ((actualCmd[0] == 'p' && len == 1) || (len >= 8 && strncmp(actualCmd, "\\get_pos", 8) == 0)) {
+    int geoAZ = getGeographicAzimuth();
+    int userEL = getUserElevation();
+    float azFloat = (float)geoAZ;
+    float elFloat = (float)userEL;
+    
+    if (extendedResponse) {
+      // Extended Response Protocol
+      char resp[128];
+      snprintf(resp, sizeof(resp), "get_pos:\nAzimuth: %.6f\nElevation: %.6f\nRPRT 0\n", azFloat, elFloat);
+      if (output) output->print(resp);
+      if (logSerial) Serial.printf("[ROTCTLD TX] %s", resp);
+    } else {
+      // Standard Response (dwie linie z wartościami)
+      char resp[64];
+      snprintf(resp, sizeof(resp), "%.6f\n%.6f\n", azFloat, elFloat);
+      if (output) output->print(resp);
+      if (logSerial) Serial.printf("[ROTCTLD TX] %s", resp);
+    }
+  }
+  // Komenda set_pos: P az el lub \set_pos az el
+  else if (actualCmd[0] == 'P' && len > 1) {
+    // Format: P az el (np. P0.4 45.4 lub P 90 45)
+    float az, el;
+    if (sscanf(&actualCmd[1], "%f %f", &az, &el) == 2) {
+      if (isAutoMode) {
+        int azInt = (int)(az + 0.5f) % 360;  // Zaokrąglij i ogranicz do 0-359
+        int elInt = (int)(el + 0.5f);
+        elInt = constrain(elInt, 0, 90);
+
+        targetAZ = geographicToInternal(azInt);
+        targetEL = userToInternalEL(elInt);
+
+        if (extendedResponse) {
+          if (output) output->print("RPRT 0\n");
+        }
+      } else {
+        if (extendedResponse) {
+          if (output) output->print("RPRT -1 (Not in AUTO mode)\n");
+        }
+        // Pokazuj powiadomienie nie częściej niż raz na 30 sekund
+        if (millis() - lastAutoNotificationTime > 30000) {
+          showNotification("PRZELACZ NA AUTO!");
+          lastAutoNotificationTime = millis();
+        }
+      }
+    } else {
+      if (logSerial) Serial.println("[ROTCTLD] Blad parsowania komendy P (sprawdz format)");
+    }
+  }
+  else if (len >= 8 && strncmp(actualCmd, "\\set_pos", 8) == 0) {
+    // Format: \set_pos az el
+    float az, el;
+    if (sscanf(&actualCmd[8], " %f %f", &az, &el) == 2) {
+      if (isAutoMode) {
+        int azInt = (int)(az + 0.5f) % 360;
+        int elInt = (int)(el + 0.5f);
+        elInt = constrain(elInt, 0, 90);
+
+        targetAZ = geographicToInternal(azInt);
+        targetEL = userToInternalEL(elInt);
+
+        if (extendedResponse) {
+          if (output) output->print("RPRT 0\n");
+        }
+      } else {
+        if (extendedResponse) {
+          if (output) output->print("RPRT -1 (Not in AUTO mode)\n");
+        }
+        // Pokazuj powiadomienie nie częściej niż raz na 30 sekund
+        if (millis() - lastAutoNotificationTime > 30000) {
+          showNotification("PRZELACZ NA AUTO!");
+          lastAutoNotificationTime = millis();
+        }
+      }
+    } else {
+      if (logSerial) Serial.println("[ROTCTLD] Blad parsowania komendy \\set_pos");
+    }
+  }
+  // Komenda stop: S lub \stop
+  else if ((actualCmd[0] == 'S' && len == 1) || (len >= 5 && strncmp(actualCmd, "\\stop", 5) == 0)) {
+    if (isAutoMode) {
+      targetAZ = currentAZ;
+      targetEL = currentEL;
+      stopMotor();
+      if (extendedResponse) {
+        if (output) output->print("RPRT 0\n");
+      }
+    }
+  }
+  // Inne komendy rotctld można dodać tutaj w przyszłości
+  else {
+    // Nieznana komenda - zwróć błąd w trybie extended
+    if (extendedResponse) {
+      if (output) output->print("RPRT -1\n");  // -1 = błąd
+    }
+    if (logSerial) {
+      Serial.printf("[ROTCTLD] Unknown command: %s\n", cmd);
+    }
+  }
+}
+
+void calibrateAZ() {
+  display.clearDisplay();
+  display.setCursor(0, 20);
+  display.print("KALIB AZ: LEWO");
+  display.setCursor(0, 35);
+  display.print("Kliknij gdy MAX");
+  display.display();
+  
+  startMotor(-1, true);  // Obracaj w lewo
+  
+  // Czekaj na kliknięcie
+  while (digitalRead(PIN_ENC_SW) == HIGH) {
+    delay(10);
+  }
+  while (digitalRead(PIN_ENC_SW) == LOW) {
+    delay(10);
+  }
+  
+  stopMotor();
+  unsigned long timeLeft = millis();
+  
+  display.clearDisplay();
+  display.setCursor(0, 20);
+  display.print("KALIB AZ: PRAWO");
+  display.setCursor(0, 35);
+  display.print("Kliknij gdy MAX");
+  display.display();
+  
+  startMotor(1, true);  // Obracaj w prawo
+  
+  // Czekaj na kliknięcie
+  while (digitalRead(PIN_ENC_SW) == HIGH) {
+    delay(10);
+  }
+  while (digitalRead(PIN_ENC_SW) == LOW) {
+    delay(10);
+  }
+  
+  unsigned long timeRight = millis();
+  stopMotor();
+  
+  unsigned long totalTime = timeRight - timeLeft;
+  TR1D_AZ = (float)totalTime / (float)PAN_MAX;  // Czas na 1 stopień
+  
+  prefs.putFloat("TR1D_AZ", TR1D_AZ);
+  
+  display.clearDisplay();
+  display.setCursor(0, 20);
+  display.printf("AZ OK: %.1f ms/st", TR1D_AZ);
+  display.display();
+  delay(2000);
+  
+  currentAZ = 0;  // Ustaw na pozycję 0 (MAXLEFT)
+  prefs.putInt("currentAZ", currentAZ);
+}
+
+void calibrateEL() {
+  display.clearDisplay();
+  display.setCursor(0, 20);
+  display.print("KALIB EL: DOL");
+  display.setCursor(0, 35);
+  display.print("Kliknij gdy MAX");
+  display.display();
+  
+  startMotor(-1, false);  // Obracaj w dół
+  
+  // Czekaj na kliknięcie
+  while (digitalRead(PIN_ENC_SW) == HIGH) {
+    delay(10);
+  }
+  while (digitalRead(PIN_ENC_SW) == LOW) {
+    delay(10);
+  }
+  
+  stopMotor();
+  unsigned long timeDown = millis();
+  
+  display.clearDisplay();
+  display.setCursor(0, 20);
+  display.print("KALIB EL: GORA");
+  display.setCursor(0, 35);
+  display.print("Kliknij gdy MAX");
+  display.display();
+  
+  startMotor(1, false);  // Obracaj w górę
+  
+  // Czekaj na kliknięcie
+  while (digitalRead(PIN_ENC_SW) == HIGH) {
+    delay(10);
+  }
+  while (digitalRead(PIN_ENC_SW) == LOW) {
+    delay(10);
+  }
+  
+  unsigned long timeUp = millis();
+  stopMotor();
+  
+  unsigned long totalTime = timeUp - timeDown;
+  TR1D_EL = (float)totalTime / (float)TILT_MAX;  // Czas na 1 stopień
+  
+  prefs.putFloat("TR1D_EL", TR1D_EL);
+  
+  display.clearDisplay();
+  display.setCursor(0, 20);
+  display.printf("EL OK: %.1f ms/st", TR1D_EL);
+  display.display();
+  delay(2000);
+  
+  currentEL = 0;  // Ustaw na pozycję 0
+  prefs.putInt("currentEL", currentEL);
+}
+
+// --- Funkcje pomocnicze ---
+
+// Funkcja bazowania (homing) po uruchomieniu
+void performHoming() {
+  if (!isCalibrated) return;
+  
+  bool silent = (remoteCtrlMode == REMOTE_USBSERIAL);
+  
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setCursor(0, 0);
+  display.print("BAZOWANIE");
+  display.setTextSize(1);
+  display.setCursor(0, 25);
+  display.print("Kliknij aby pominac");
+  display.setCursor(0, 45);
+  display.print("Start za 2 sek...");
+  display.display();
+
+  // Krótkie oczekiwanie na pominięcie
+  unsigned long waitStart = millis();
+  while (millis() - waitStart < 2000) {
+    if (digitalRead(PIN_ENC_SW) == LOW) {
+      if (!silent) Serial.println("[HOMING] Pominieto bazowanie.");
+      return;
+    }
+    delay(10);
+  }
+
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setCursor(0, 10);
+  display.print("BAZOWANIE");
+  display.setTextSize(1);
+  display.setCursor(0, 35);
+  display.print("AZ -> 0...");
+  display.display();
+
+  // 1. AZYMUT (W LEWO do oporu)
+  unsigned long moveTimeAZ = (unsigned long)(PAN_MAX * TR1D_AZ);
+  if (moveTimeAZ > 0) {
+    if (!silent) Serial.printf("[HOMING] AZ: %lu ms\n", moveTimeAZ);
+    startMotor(-1, true);
+    unsigned long start = millis();
+    while (millis() - start < moveTimeAZ) {
+      if (digitalRead(PIN_ENC_SW) == LOW) { stopMotor(); return; } // Przerwij
+      webServer.handleClient(); 
+      delay(10);
+    }
+    stopMotor();
+  }
+
+  display.setCursor(0, 45);
+  display.print("EL -> 0...");
+  display.display();
+
+  // 2. ELEWACJA (W DÓŁ do oporu)
+  unsigned long moveTimeEL = (unsigned long)(TILT_MAX * TR1D_EL);
+  if (moveTimeEL > 0) {
+    if (!silent) Serial.printf("[HOMING] EL: %lu ms\n", moveTimeEL);
+    startMotor(-1, false);
+    unsigned long start = millis();
+    while (millis() - start < moveTimeEL) {
+      if (digitalRead(PIN_ENC_SW) == LOW) { stopMotor(); return; } // Przerwij
+      webServer.handleClient();
+      delay(10);
+    }
+    stopMotor();
+  }
+
+  // Reset pozycji
+  currentAZ = 0;
+  targetAZ = 0;
+  currentEL = 0;
+  prefs.putInt("currentAZ", 0);
+  prefs.putInt("currentEL", 0);
+  
+  // Ustaw cel na 0 użytkownika (wypoziomowanie)
+  targetEL = userToInternalEL(0);
+  
+  display.clearDisplay();
+  display.setCursor(0, 20);
+  display.setTextSize(2);
+  display.print("GOTOWE");
+  display.display();
+  delay(1000);
+}
+
+void scanI2C() {
+  Serial.println("\n=== SKANOWANIE I2C ===");
+  byte found = 0;
+  
+  for (byte address = 1; address < 127; address++) {
+    Wire.beginTransmission(address);
+    byte error = Wire.endTransmission();
+    
+    if (error == 0) {
+      Serial.printf("Znaleziono urzadzenie I2C na adresie: 0x%02X", address);
+      
+      // Rozpoznaj typ urządzenia
+      if (address == 0x3C || address == 0x3D) {
+        Serial.print(" (prawdopodobnie OLED SSD1306)");
+      }
+      
+  Serial.println();
+      found++;
+    } else if (error == 4) {
+      Serial.printf("Blad na adresie 0x%02X (nieznany blad)\n", address);
+    }
+  }
+  
+  if (found == 0) {
+    Serial.println("Nie znaleziono zadnych urzaden I2C!");
+  } else {
+    Serial.printf("Znaleziono %d urzaden(ia) I2C\n", found);
+  }
+  Serial.println("=====================\n");
+}
+
+// Obsługa WebServer - główna strona WWW
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+  html += "<title>SP3KON Rotor Control</title>";
+  html += "<style>body{font-family:Arial,sans-serif;margin:10px;background:#f0f2f5;text-align:center;}";
+  html += "h1{color:#1a73e8;margin-bottom:10px;} .section{margin:15px auto;padding:15px;background:white;border-radius:10px;box-shadow:0 2px 4px rgba(0,0,0,0.1);max-width:500px;}";
+  html += ".btn{padding:12px 24px;border:none;border-radius:5px;cursor:pointer;font-weight:bold;margin:5px;transition:0.3s;}";
+  html += ".btn-auto{background:#1a73e8;color:white;} .btn-man{background:#ea4335;color:white;}";
+  html += ".btn-ctrl{background:#5f6368;color:white;width:60px;height:60px;font-size:24px;} .btn-stop{background:#ea4335;width:130px;}";
+  html += ".btn-set{background:#34a853;color:white;} .control-grid{display:grid;grid-template-columns:repeat(3,70px);grid-gap:10px;justify-content:center;margin:15px 0;}";
+  html += "input{padding:10px;border:1px solid #ddd;border-radius:5px;width:70px;margin:5px;} label{font-weight:bold;display:block;margin-top:10px;}";
+  html += "a{color:#1a73e8;text-decoration:none;font-weight:bold;}.info-link{display:block;margin:10px 0;font-size:18px;}</style></head><body>";
+  
+  html += "<h1>SP3KON Rotor Control</h1>";
+  html += "<a href='/info' class='info-link'>📄 INSTRUKCJA (INFO)</a>";
+
+  // --- SEKCOJA STEROWANIA ---
+  html += "<div class='section'><h2>Sterowanie</h2>";
+  
+  // Pozycje na żywo (aktualizowane przez JavaScript)
+  html += "<div style='margin-bottom:15px;padding:10px;background:#e8f0fe;border-radius:5px;'>";
+  html += "<p style='margin:5px 0;'><strong>Pozycja AZ:</strong> <span id='positionAZ'>" + String(getGeographicAzimuth()) + "</span>°</p>";
+  html += "<p style='margin:5px 0;'><strong>Pozycja EL:</strong> <span id='positionEL'>" + String(getUserElevation()) + "</span>°</p>";
+  html += "</div>";
+  
+  // Przełącznik AUTO/MANUAL
+  html += "<p>Tryb pracy: <strong>" + String(isAutoMode ? "AUTO (Zdalny)" : "MANUAL (Ręczny)") + "</strong></p>";
+  html += "<form action='/toggleAuto' method='POST'><button class='btn " + String(isAutoMode ? "btn-man" : "btn-auto") + "'>";
+  html += isAutoMode ? "PRZEŁĄCZ NA RĘCZNY" : "PRZEŁĄCZ NA AUTO";
+  html += "</button></form>";
+
+  if (!isAutoMode) {
+    // Klawisze strzałek dla trybu MANUAL z obsługą przytrzymania
+    html += "<div class='control-grid'>";
+    html += "<div></div>";
+    html += "<button class='btn btn-ctrl' id='btnUp' type='button'>▲</button>";
+    html += "<div></div>";
+    html += "<button class='btn btn-ctrl' id='btnLeft' type='button'>◀</button>";
+    html += "<button class='btn btn-ctrl btn-stop' id='btnStop' type='button' style='width:60px;'>■</button>";
+    html += "<button class='btn btn-ctrl' id='btnRight' type='button'>▶</button>";
+    html += "<div></div>";
+    html += "<button class='btn btn-ctrl' id='btnDown' type='button'>▼</button>";
+    html += "<div></div>";
+    html += "</div>";
+    html += "<p><small>Przytrzymaj strzałkę aby poruszać ciągle | Kliknij ■ aby zatrzymać</small></p>";
+  } else {
+    // Pole USTAW dla trybu AUTO
+    html += "<form action='/setpos' method='GET' style='margin-top:20px;'>";
+    html += "AZ: <input type='number' name='az' value='000' min='0' max='359'>";
+    html += " EL: <input type='number' name='el' value='000' min='0' max='90'>";
+    html += "<br><button class='btn btn-set'>USTAW POZYCJĘ</button></form>";
+  }
+  html += "</div>";
+
+  // --- SEKCOJA USTAWIEŃ ROTORA ---
+  html += "<div class='section'><h2>Ustawienia Rotora</h2><form action='/save' method='POST'>";
+  html += "<label>Zakres PAN (0-365°):</label><input type='number' name='pan' value='" + String(PAN_MAX) + "' min='0' max='365' style='width:150px;'>";
+  html += "<label>Zakres TILT (0-90°):</label><input type='number' name='tilt' value='" + String(TILT_MAX) + "' min='0' max='90' style='width:150px;'>";
+  html += "<label>Prędkość RS485:</label><select name='speed' style='padding:10px;width:170px;'>";
+  html += "<option value='2400'" + String(commSpeed == 2400 ? " selected" : "") + ">2400 bps</option>";
+  html += "<option value='9600'" + String(commSpeed == 9600 ? " selected" : "") + ">9600 bps</option></select>";
+  html += "<label>Kierunek 0 (Azymut):</label><input type='number' name='dir' value='" + String(direction) + "' min='0' max='359' style='width:150px;'>";
+  html += "<label>Skala PAN:</label><select name='revpan' style='padding:10px;width:170px;'>";
+  html += "<option value='0'" + String(!reversePAN ? " selected" : "") + ">Normal</option><option value='1'" + String(reversePAN ? " selected" : "") + ">Reverse</option></select>";
+  html += "<label>Skala TILT:</label><select name='revtilt' style='padding:10px;width:170px;'>";
+  html += "<option value='0'" + String(!reverseTILT ? " selected" : "") + ">Normal</option><option value='1'" + String(reverseTILT ? " selected" : "") + ">Reverse</option></select>";
+  html += "<br><button class='btn btn-auto' style='margin-top:15px;'>ZAPISZ USTAWIENIA</button></form></div>";
+
+  // --- KONFIGURACJA WIFI ---
+  String savedSSID = prefs.getString("wifiSSID", "");
+  html += "<div class='section'><h2>Konfiguracja WiFi</h2>";
+  html += "<form action='/savewifi' method='POST'>";
+  html += "<label>SSID:</label><input type='text' name='ssid' value='" + savedSSID + "' style='width:200px;'>";
+  html += "<label>Hasło:</label><input type='password' name='pass' style='width:200px;'>";
+  html += "<br><button class='btn btn-auto' style='margin-top:15px;'>ZAPISZ WIFI</button></form></div>";
+
+  // --- INFORMACJE O SYSTEMIE ---
+  html += "<div class='section'><h2>System Info</h2>";
+  
+  // Pobierz wartości dokładnie tak samo jak dla OLED
+  int displayAZ = getGeographicAzimuth();
+  int displayEL = getUserElevation();
+  
+  html += "<p><strong>Pozycja AZ:</strong> " + String(displayAZ) + "°</p>";
+  html += "<p><strong>Pozycja EL:</strong> " + String(displayEL) + "°</p>";
+  html += "<p><strong>Kalibracja:</strong> " + String(isCalibrated ? "TAK" : "BRAK") + "</p>";
+  
+  // WiFi Status w System Info
+  String ipStr = wifiConnected ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
+  String modeStr = wifiConnected ? "Połączono (STA)" : "Punkt Dostępowy (AP)";
+  html += "<hr><p><strong>Status WiFi:</strong> " + modeStr + "</p>";
+  html += "<p><strong>Adres IP:</strong> " + ipStr + "</p>";
+  
+  if (isCalibrated) {
+    html += "<p><small>TR1D_AZ: " + String(TR1D_AZ, 2) + " ms/°, TR1D_EL: " + String(TR1D_EL, 2) + " ms/°</small></p>";
+  }
+  html += "</div>";
+  
+  // JavaScript do aktualizacji pozycji na żywo i sterowania ręcznego (na końcu body)
+  html += "<script>";
+  html += "console.log('Skrypt załadowany');";
+  html += "var manualInterval = null;";
+  html += "var currentManualDir = null;";
+  html += "";
+  html += "function updatePosition() {";
+  html += "  var azEl = document.getElementById('positionAZ');";
+  html += "  var elEl = document.getElementById('positionEL');";
+  html += "  if (!azEl || !elEl) {";
+  html += "    console.log('Elementy DOM nie znalezione: positionAZ=' + (azEl ? 'OK' : 'NULL') + ', positionEL=' + (elEl ? 'OK' : 'NULL'));";
+  html += "    return;";
+  html += "  }";
+  html += "  var xhr = new XMLHttpRequest();";
+  html += "  xhr.open('GET', '/api/position', true);";
+  html += "  xhr.onreadystatechange = function() {";
+  html += "    if (xhr.readyState === 4) {";
+  html += "      if (xhr.status === 200) {";
+  html += "        try {";
+  html += "          var data = JSON.parse(xhr.responseText);";
+  html += "          azEl.textContent = data.az;";
+  html += "          elEl.textContent = data.el;";
+  html += "        } catch(e) {";
+  html += "          console.error('Błąd parsowania JSON:', e, xhr.responseText);";
+  html += "        }";
+  html += "      } else {";
+  html += "        console.error('Błąd HTTP:', xhr.status);";
+  html += "      }";
+  html += "    }";
+  html += "  };";
+  html += "  xhr.onerror = function() { console.error('Błąd połączenia z /api/position'); };";
+  html += "  xhr.send();";
+  html += "}";
+  html += "";
+  html += "function manualControl(dir, start) {";
+  html += "  console.log('manualControl:', dir, start);";
+  html += "  if (dir === 'stop') {";
+  html += "    if (manualInterval) {";
+  html += "      clearInterval(manualInterval);";
+  html += "      manualInterval = null;";
+  html += "    }";
+  html += "    currentManualDir = null;";
+  html += "    sendManualCommand('stop');";
+  html += "    return;";
+  html += "  }";
+  html += "  ";
+  html += "  if (start) {";
+  html += "    if (currentManualDir !== dir) {";
+  html += "      if (manualInterval) {";
+  html += "        clearInterval(manualInterval);";
+  html += "      }";
+  html += "      currentManualDir = dir;";
+  html += "      sendManualCommand(dir);";
+  html += "      manualInterval = setInterval(function() {";
+  html += "        sendManualCommand(dir);";
+  html += "      }, 250);";
+  html += "    }";
+  html += "  } else {";
+  html += "    if (currentManualDir === dir) {";
+  html += "      if (manualInterval) {";
+  html += "        clearInterval(manualInterval);";
+  html += "        manualInterval = null;";
+  html += "      }";
+  html += "      currentManualDir = null;";
+  html += "      sendManualCommand('stop');";
+  html += "    }";
+  html += "  }";
+  html += "}";
+  html += "";
+  html += "function sendManualCommand(dir) {";
+  html += "  var xhr = new XMLHttpRequest();";
+  html += "  xhr.open('GET', '/manual?dir=' + dir, true);";
+  html += "  xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');";
+  html += "  xhr.onerror = function() { console.error('Błąd wysyłania komendy:', dir); };";
+  html += "  xhr.send();";
+  html += "}";
+  html += "";
+  html += "function initManualButtons() {";
+  html += "  console.log('Inicjalizacja przycisków');";
+  html += "  var btnUp = document.getElementById('btnUp');";
+  html += "  var btnDown = document.getElementById('btnDown');";
+  html += "  var btnLeft = document.getElementById('btnLeft');";
+  html += "  var btnRight = document.getElementById('btnRight');";
+  html += "  var btnStop = document.getElementById('btnStop');";
+  html += "  ";
+  html += "  if (btnUp) {";
+  html += "    btnUp.addEventListener('mousedown', function(e) { e.preventDefault(); manualControl('up', true); });";
+  html += "    btnUp.addEventListener('mouseup', function(e) { e.preventDefault(); manualControl('up', false); });";
+  html += "    btnUp.addEventListener('mouseleave', function(e) { e.preventDefault(); manualControl('up', false); });";
+  html += "    btnUp.addEventListener('touchstart', function(e) { e.preventDefault(); manualControl('up', true); });";
+  html += "    btnUp.addEventListener('touchend', function(e) { e.preventDefault(); manualControl('up', false); });";
+  html += "    btnUp.addEventListener('touchcancel', function(e) { e.preventDefault(); manualControl('up', false); });";
+  html += "  }";
+  html += "  if (btnDown) {";
+  html += "    btnDown.addEventListener('mousedown', function(e) { e.preventDefault(); manualControl('down', true); });";
+  html += "    btnDown.addEventListener('mouseup', function(e) { e.preventDefault(); manualControl('down', false); });";
+  html += "    btnDown.addEventListener('mouseleave', function(e) { e.preventDefault(); manualControl('down', false); });";
+  html += "    btnDown.addEventListener('touchstart', function(e) { e.preventDefault(); manualControl('down', true); });";
+  html += "    btnDown.addEventListener('touchend', function(e) { e.preventDefault(); manualControl('down', false); });";
+  html += "    btnDown.addEventListener('touchcancel', function(e) { e.preventDefault(); manualControl('down', false); });";
+  html += "  }";
+  html += "  if (btnLeft) {";
+  html += "    btnLeft.addEventListener('mousedown', function(e) { e.preventDefault(); manualControl('left', true); });";
+  html += "    btnLeft.addEventListener('mouseup', function(e) { e.preventDefault(); manualControl('left', false); });";
+  html += "    btnLeft.addEventListener('mouseleave', function(e) { e.preventDefault(); manualControl('left', false); });";
+  html += "    btnLeft.addEventListener('touchstart', function(e) { e.preventDefault(); manualControl('left', true); });";
+  html += "    btnLeft.addEventListener('touchend', function(e) { e.preventDefault(); manualControl('left', false); });";
+  html += "    btnLeft.addEventListener('touchcancel', function(e) { e.preventDefault(); manualControl('left', false); });";
+  html += "  }";
+  html += "  if (btnRight) {";
+  html += "    btnRight.addEventListener('mousedown', function(e) { e.preventDefault(); manualControl('right', true); });";
+  html += "    btnRight.addEventListener('mouseup', function(e) { e.preventDefault(); manualControl('right', false); });";
+  html += "    btnRight.addEventListener('mouseleave', function(e) { e.preventDefault(); manualControl('right', false); });";
+  html += "    btnRight.addEventListener('touchstart', function(e) { e.preventDefault(); manualControl('right', true); });";
+  html += "    btnRight.addEventListener('touchend', function(e) { e.preventDefault(); manualControl('right', false); });";
+  html += "    btnRight.addEventListener('touchcancel', function(e) { e.preventDefault(); manualControl('right', false); });";
+  html += "  }";
+  html += "  if (btnStop) {";
+  html += "    btnStop.addEventListener('click', function(e) { e.preventDefault(); manualControl('stop', false); });";
+  html += "  }";
+  html += "  console.log('Przyciski zainicjalizowane: Up=' + (btnUp ? 'OK' : 'NULL') + ', Down=' + (btnDown ? 'OK' : 'NULL') + ', Left=' + (btnLeft ? 'OK' : 'NULL') + ', Right=' + (btnRight ? 'OK' : 'NULL') + ', Stop=' + (btnStop ? 'OK' : 'NULL'));";
+  html += "}";
+  html += "";
+  html += "// Inicjalizacja";
+  html += "console.log('Rozpoczynam inicjalizację');";
+  html += "updatePosition();"; // Pierwsze wywołanie
+  html += "setInterval(updatePosition, 500);"; // Co 500ms
+  html += "initManualButtons();"; // Inicjalizuj przyciski
+  html += "";
+  html += "window.addEventListener('beforeunload', function() {";
+  html += "  if (manualInterval) {";
+  html += "    sendManualCommand('stop');";
+  html += "  }";
+  html += "});";
+  html += "</script>";
+  html += "</body></html>";
+  
+  webServer.send(200, "text/html", html);
+}
+
+// Obsługa zapisu ustawień rotora
+void handleSaveSettings() {
+  if (webServer.hasArg("pan")) {
+    PAN_MAX = webServer.arg("pan").toInt();
+    PAN_MAX = constrain(PAN_MAX, 0, 365);
+    prefs.putInt("PAN_MAX", PAN_MAX);
+  }
+  if (webServer.hasArg("tilt")) {
+    TILT_MAX = webServer.arg("tilt").toInt();
+    TILT_MAX = constrain(TILT_MAX, 0, 90);
+    prefs.putInt("TILT_MAX", TILT_MAX);
+  }
+  if (webServer.hasArg("speed")) {
+    commSpeed = webServer.arg("speed").toInt();
+    prefs.putInt("commSpeed", commSpeed);
+    Serial2.end();
+    delay(100);
+    Serial2.begin(commSpeed, SERIAL_8N1, RS485_RX, RS485_TX);
+  }
+  if (webServer.hasArg("dir")) {
+    direction = webServer.arg("dir").toInt();
+    direction = constrain(direction, 0, 359);
+    prefs.putInt("direction", direction);
+  }
+  if (webServer.hasArg("revpan")) {
+    reversePAN = (webServer.arg("revpan") == "1");
+    prefs.putBool("reversePAN", reversePAN);
+  }
+  if (webServer.hasArg("revtilt")) {
+    reverseTILT = (webServer.arg("revtilt") == "1");
+    prefs.putBool("reverseTILT", reverseTILT);
+  }
+  webServer.send(200, "text/html", "<html><body><h1>Settings Saved!</h1><p><a href='/'>Back</a></p></body></html>");
+}
+
+// Przełączanie trybu AUTO/MANUAL przez WWW
+void handleToggleAuto() {
+  isAutoMode = !isAutoMode;
+  prefs.putBool("isAutoMode", isAutoMode);
+  if (!isAutoMode) {
+    stopMotor();
+    targetAZ = currentAZ;
+    targetEL = currentEL;
+  }
+  webServer.sendHeader("Location", "/");
+  webServer.send(303);
+}
+
+// Sterowanie ręczne przez WWW (strzałki)
+void handleManualCmd() {
+  if (isAutoMode) {
+    webServer.send(400, "text/plain", "Błąd: Najpierw wyłącz tryb AUTO");
+    return;
+  }
+  
+  String cmd = webServer.arg("dir");
+  if (cmd == "left") startMotor(-1, true);
+  else if (cmd == "right") startMotor(1, true);
+  else if (cmd == "up") startMotor(1, false);
+  else if (cmd == "down") startMotor(-1, false);
+  else if (cmd == "stop") stopMotor();
+  
+  // Sprawdź czy to żądanie AJAX (z nagłówkiem X-Requested-With)
+  String requestedWith = webServer.header("X-Requested-With");
+  if (requestedWith == "XMLHttpRequest") {
+    // Zwróć prostą odpowiedź JSON dla AJAX
+    webServer.send(200, "application/json", "{\"status\":\"ok\"}");
+  } else {
+    // Standardowe przekierowanie dla zwykłych żądań (kompatybilność wsteczna)
+    webServer.sendHeader("Location", "/");
+    webServer.send(303);
+  }
+}
+
+// Ustawienie pozycji przez WWW (pole tekstowe + przycisk USTAW)
+void handleSetPos() {
+  if (!isAutoMode) {
+    webServer.send(400, "text/plain", "Błąd: Najpierw włącz tryb AUTO");
+    return;
+  }
+
+  if (webServer.hasArg("az")) {
+    int azVal = webServer.arg("az").toInt();
+    targetAZ = geographicToInternal(azVal % 360);
+  }
+  if (webServer.hasArg("el")) {
+    int elVal = webServer.arg("el").toInt();
+    targetEL = userToInternalEL(constrain(elVal, 0, 90));
+  }
+  
+  webServer.sendHeader("Location", "/");
+  webServer.send(303);
+}
+
+// Obsługa API pozycji (JSON) - dla aktualizacji na żywo
+void handlePositionAPI() {
+  int displayAZ = getGeographicAzimuth();
+  int displayEL = getUserElevation();
+  
+  String json = "{";
+  json += "\"az\":" + String(displayAZ) + ",";
+  json += "\"el\":" + String(displayEL);
+  json += "}";
+  
+  webServer.send(200, "application/json", json);
+}
+
+// Obsługa strony INFO - wyświetla zawartość info.txt
+void handleInfo() {
+  String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>SP3KON Rotor - INFO</title>";
+  html += "<style>body{font-family:Arial;margin:20px;background:#f0f0f0;line-height:1.6;}";
+  html += "h1{color:#333;} h2{color:#555;margin-top:30px;border-bottom:2px solid #ccc;padding-bottom:5px;}";
+  html += ".container{max-width:800px;margin:0 auto;background:white;padding:30px;border-radius:5px;box-shadow:0 2px 5px rgba(0,0,0,0.1);}";
+  html += "pre{background:#f5f5f5;padding:15px;border-radius:5px;overflow-x:auto;white-space:pre-wrap;font-size:14px;}";
+  html += "a{color:#2196F3;text-decoration:none;} a:hover{text-decoration:underline;}";
+  html += ".back-link{display:block;margin-top:20px;padding:10px;background:#4CAF50;color:white;text-align:center;border-radius:5px;}";
+  html += "</style></head><body><div class='container'>";
+  html += "<h1>SP3KON Rotor Control - Instrukcja Obsługi</h1>";
+  html += "<a href='/' class='back-link'>← Powrót do strony głównej</a>";
+  
+  // Wczytaj zawartość info.txt - osadzona w kodzie
+  html += "<pre>";
+  html += readInfoFile();
+  html += "</pre>";
+  
+  html += "<a href='/' class='back-link'>← Powrót do strony głównej</a>";
+  html += "</div></body></html>";
+  
+  webServer.send(200, "text/html", html);
+}
+
+// Funkcja zwracająca zawartość pliku info.txt (osadzona w kodzie)
+String readInfoFile() {
+  // Zawartość pliku info.txt osadzona bezpośrednio w kodzie
+  // Ze względu na długość, zwracamy pełną treść z pliku info.txt
+  // UWAGA: Plik info.txt zawiera informacje o wersji 3.2 - część informacji może wymagać aktualizacji
+  
+  return 
+    "================================================================================\n"
+    "    UNIWERSALNY STEROWNIK ROTORA SP3KON v3.2 - INSTRUKCJA OBSŁUGI\n"
+    "================================================================================\n\n"
+    
+    "1. PODŁĄCZENIE ELEKTRYCZNE MODUŁÓW\n"
+    "================================================================================\n\n"
+    
+    "ESP32 WROOM-32:\n"
+    "----------------\n"
+    "VCC      -> 3.3V (zasilanie)\n"
+    "GND      -> GND (masa)\n"
+    "EN       -> 3.3V (lub przycisk reset - opcjonalnie)\n\n"
+    
+    "WYŚWIETLACZ OLED SSD1306 (128x64, I2C):\n"
+    "----------------------------------------\n"
+    "VCC      -> 3.3V\n"
+    "GND      -> GND\n"
+    "SDA      -> GPIO 21 (I2C Data)\n"
+    "SCL      -> GPIO 22 (I2C Clock)\n"
+    "Adres I2C: 0x3C\n\n"
+    
+    "ENKODER OBROTOWY Z PRZYCISKIEM:\n"
+    "--------------------------------\n"
+    "VCC      -> 3.3V\n"
+    "GND      -> GND\n"
+    "SW       -> GPIO 27 (Przycisk, z pull-up wbudowanym)\n"
+    "A        -> GPIO 32 (Kanał A, z pull-up wbudowanym)\n"
+    "B        -> GPIO 33 (Kanał B, z pull-up wbudowanym)\n\n"
+    
+    "MODUŁ RS485 (komunikacja z rotorem):\n"
+    "-------------------------------------\n"
+    "VCC      -> 5V (lub 3.3V w zależności od modułu)\n"
+    "GND      -> GND\n"
+    "RO (lub TX) -> GPIO 13 (ESP32 RX)\n"
+    "DI (lub RX) -> GPIO 14 (ESP32 TX)\n"
+    "  * Jeśli moduł ma piny RX/TX:\n"
+    "    - Pin RX modułu -> GPIO 14 (TX ESP32)\n"
+    "    - Pin TX modułu -> GPIO 13 (RX ESP32)\n"
+    "DE/RE    -> Połączony z GND (tryb odbioru) lub sterowany osobno\n"
+    "          (dla modułów z kontrolą kierunku)\n\n"
+    
+    "LED WSKAŹNIKOWY:\n"
+    "-----------------\n"
+    "Wbudowana LED ESP32 WROOM -> GPIO 2 (domyślnie używana w kodzie)\n\n"
+    
+    "UWAGI:\n"
+    "------\n"
+    "- Wszystkie moduły zasilane z 3.3V (oprócz RS485 jeśli wymaga 5V)\n"
+    "- Wspólna masa (GND) dla wszystkich modułów\n"
+    "- Piny 32 i 33 mają wbudowane pull-up, nie wymagają zewnętrznych rezystorów\n"
+    "- Moduł RS485 może wymagać dodatkowego zasilania 5V w zależności od typu\n"
+    "- Dla bezpieczeństwa użyj kondensatorów odsprzęgających (100µF) przy zasilaniu\n\n"
+    
+    "================================================================================\n\n"
+    
+    "2. DRZEWKO MENU\n"
+    "================================================================================\n\n"
+    
+    "MAIN_SCR (Ekran główny)\n"
+    "│\n"
+    "├─> MENU_ROOT (Menu główne)\n"
+    "│   │\n"
+    "│   ├─> [0] AUTO/MANUAL - Przełączanie trybu pracy\n"
+    "│   │   - kliknięcie: przełącza AUTO <-> MANUAL (bez wchodzenia do podmenu)\n"
+    "│   │   - w trybie AUTO: rotorem steruje aplikacja nadrzędna (Serial USB lub TCP/IP)\n"
+    "│   │   - w trybie MANUAL: cel ustawiany enkoderem\n"
+    "│   │\n"
+    "│   ├─> [1] ROTOR SET - Ustawienia rotora\n"
+    "│   │   │\n"
+    "│   │   ├─> [0] PAN - Maksymalny kąt obrotu (0-365°)\n"
+    "│   │   ├─> [1] TILT - Maksymalny kąt elewacji (0-90°)\n"
+    "│   │   ├─> [2] SPEED - Prędkość komunikacji RS485\n"
+    "│   │   ├─> [3] DIR - Kierunek geograficzny pozycji 0 (0-359°)\n"
+    "│   │   ├─> [4] PAN SCALE - Skala pozioma (Normal/Reverse)\n"
+    "│   │   └─> [5] TILT SCALE - Skala pionowa (Normal/Reverse)\n"
+    "│   │\n"
+    "│   ├─> [2] KALIB AZ - Kalibracja azymutu\n"
+    "│   ├─> [3] KALIB EL - Kalibracja elewacji\n"
+    "│   ├─> [4] ALARMY - Lista aktywnych alarmów\n"
+    "│   ├─> [5] INFO - Informacje o systemie\n"
+    "│   └─> [6] REMOTE CTRL - Wybór trybu komunikacji zdalnej\n"
+    "│       ├─> [0] USBSERIAL - Komendy przez Serial USB (protokół GS-232A)\n"
+    "│       └─> [1] TCPIP - Komendy przez WiFi TCP/IP (protokół rotctld/Hamlib)\n\n"
+    
+    "NAWIGACJA:\n"
+    "----------\n"
+    "- Krótkie kliknięcie przycisku: wejście do menu / akcja\n"
+    "- Długie kliknięcie (>400ms): powrót do poprzedniego menu\n"
+    "- Enkoder: nawigacja w menu / zmiana wartości\n\n"
+    
+    "================================================================================\n\n"
+    
+    "3. KOMUNIKACJA Z KOMPUTEREM\n"
+    "================================================================================\n\n"
+    
+    "TRYBY KOMUNIKACJI ZDALNEJ (Menu → REMOTE CTRL):\n"
+    "------------------------------------------------\n"
+    "1. USBSERIAL - Komunikacja przez Serial USB (port COM)\n"
+    "   - Protokół: Yaesu GS-232A\n"
+    "   - Prędkość: 57600 bps\n"
+    "   - Komendy: C, M, B, W, S, A, E, L, R, U, D\n"
+    "   - Użycie: Orbitron, Gpredict, SatPC32 → Port COM (bez logów debug)\n\n"
+    
+    "2. TCPIP - Komunikacja przez WiFi TCP/IP\n"
+    "   - Protokół: rotctld/Hamlib\n"
+    "   - Port TCP: 4533\n"
+    "   - Tryb WiFi: AP (SSID: ROTORSP3KON) lub połączenie z siecią domową\n"
+    "   - Komendy: P, p, \\get_pos, \\set_pos, S, \\stop\n"
+    "   - Kompatybilny z: SkyROOF, Tucnak (Remote rotator)\n"
+    "   - Strona WWW: http://IP_urzadzenia (konfiguracja parametrów i WiFi)\n\n"
+    
+    "WAŻNE: Sterowanie z komputera działa tylko w trybie AUTO.\n\n"
+    
+    "================================================================================\n\n"
+    
+    "4. NOWE FUNKCJE I ZMIANY W WERSJI 3.2:\n"
+    "================================================================================\n"
+    "- Automatyczne bazowanie (homing) do pozycji 0/0 po uruchomieniu urządzenia\n"
+    "- Nowa strona WWW (http://IP_urzadzenia) z panelem sterowania (Manual/Auto)\n"
+    "- Sterowanie strzałkami i ustawianie azymutu/elewacji przez przeglądarkę\n"
+    "- Rozdzielenie protokołów: GS-232A (Serial USB) / rotctld (TCP/IP)\n"
+    "- Mechanizm zabezpieczający przed oscylacjami (3 próby dążenia do celu)\n"
+    "- Odwrócenie skali PAN/TILT (Normal/Reverse) - mapowanie współrzędnych\n"
+    "- WiFi: Automatyczne połączenie z siecią domową lub tryb Access Point\n"
+    "- Menu INFO na OLED wyświetla aktualny adres IP urządzenia\n"
+    "- WiFi Sleep wyłączone dla poprawy stabilności połączeń TCP\n\n"
+    
+    "================================================================================\n\n"
+    
+    "Wersja oprogramowania: 3.2 (2026-01-19)\n"
+    "Kompatybilność: ESP32 WROOM-32, WROVER-E, DevKitC\n"
+    "================================================================================\n";
+}
+
+// Obsługa zapisu ustawień WiFi
+void handleSaveWiFi() {
+  if (webServer.hasArg("ssid")) {
+    String ssid = webServer.arg("ssid");
+    String password = webServer.hasArg("pass") ? webServer.arg("pass") : "";
+    prefs.putString("wifiSSID", ssid);
+    prefs.putString("wifiPassword", password);
+    webServer.send(200, "text/html", "<html><body><h1>WiFi Settings Saved!</h1><p>Restart device to apply changes.</p><p><a href='/'>Back</a></p></body></html>");
+  } else {
+    webServer.send(400, "text/html", "<html><body><h1>Error</h1><p><a href='/'>Back</a></p></body></html>");
+  }
+}
+
+// Inicjalizacja WiFi - najpierw próba połączenia z siecią domową, potem AP
+void initWiFi() {
+  // Wczytaj SSID i hasło z Preferences
+  String ssid = prefs.getString("wifiSSID", "");
+  String password = prefs.getString("wifiPassword", "");
+  bool silent = (remoteCtrlMode == REMOTE_USBSERIAL);
+  
+  if (ssid.length() > 0) {
+    // Próbuj połączyć się z siecią domową
+    if (!silent) Serial.printf("Laczenie z siecia: %s\n", ssid.c_str());
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid.c_str(), password.c_str());
+    
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {  // 10 sekund timeout
+      delay(500);
+      if (!silent) Serial.print(".");
+      attempts++;
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiConnected = true;
+      if (!silent) Serial.printf("\nPolaczono z siecia! IP: %s\n", WiFi.localIP().toString().c_str());
+    } else {
+      if (!silent) Serial.println("\nNie udalo sie polaczyc z siecia domowa - tworze AP");
+    }
+  }
+  
+  // Jeśli nie połączono z siecią domową, utwórz AP
+  if (!wifiConnected) {
+    WiFi.mode(WIFI_AP);
+    if (WiFi.softAP("ROTORSP3KON", "")) {  // Bez hasła
+      wifiConnected = false;  // AP mode, nie "connected"
+      if (!silent) Serial.printf("WiFi AP: ROTORSP3KON, IP: %s\n", WiFi.softAPIP().toString().c_str());
+    } else {
+      if (!silent) Serial.println("BLAD: Nie mozna uruchomic WiFi AP!");
+    }
+  }
+  
+  // Uruchom serwery
+  tcpServer.begin();
+  webServer.on("/", handleRoot);
+  webServer.on("/save", handleSaveSettings);
+  webServer.on("/savewifi", handleSaveWiFi);
+  webServer.on("/info", handleInfo);
+  webServer.on("/toggleAuto", handleToggleAuto);
+  webServer.on("/manual", handleManualCmd);
+  webServer.on("/setpos", handleSetPos);
+  webServer.on("/api/position", handlePositionAPI);
+  webServer.begin();
+  if (!silent) {
+    Serial.printf("TCP Server na porcie: %d\n", TCP_PORT);
+    Serial.printf("Web Server na porcie: %d\n", HTTP_PORT);
+  }
+}
+
+void setup() {
+  Serial.begin(57600);
+  delay(1000);  // Czekaj na stabilizację Serial
+  
+  prefs.begin("rotor", false);
+  PAN_MAX = prefs.getInt("PAN_MAX", 365);
+  TILT_MAX = prefs.getInt("TILT_MAX", 90);
+  commSpeed = prefs.getInt("commSpeed", 2400);
+  direction = prefs.getInt("direction", 0);
+  remoteCtrlMode = (RemoteCtrlMode)prefs.getInt("remoteCtrlMode", REMOTE_USBSERIAL);
+  isAutoMode = prefs.getBool("isAutoMode", false);
+  reversePAN = prefs.getBool("reversePAN", false);
+  reverseTILT = prefs.getBool("reverseTILT", false);
+
+  // Synchronizuj indeks menu
+  if (remoteCtrlMode == REMOTE_USBSERIAL) remoteMenuIdx = 0;
+  else if (remoteCtrlMode == REMOTE_TCPIP) remoteMenuIdx = 1;
+
+  bool silent = (remoteCtrlMode == REMOTE_USBSERIAL);
+
+  // Inicjalizuj I2C
+  Wire.begin(I2C_SDA, I2C_SCL);
+  if (!silent) scanI2C();
+  
+  // Inicjalizuj Serial2 z wczytaną prędkością
+  Serial2.begin(commSpeed, SERIAL_8N1, RS485_RX, RS485_TX);
+  
+  // Wczytaj parametry kalibracji
+  TR1D_AZ = prefs.getFloat("TR1D_AZ", 0.0);
+  TR1D_EL = prefs.getFloat("TR1D_EL", 0.0);
+  currentAZ = prefs.getInt("currentAZ", 0);
+  currentEL = prefs.getInt("currentEL", 0);
+  
+  // Ogranicz pozycje do aktualnych zakresów
+  currentAZ = constrain(currentAZ, 0, PAN_MAX);
+  currentEL = constrain(currentEL, 0, TILT_MAX);
+  
+  isCalibrated = (TR1D_AZ > 0 && TR1D_EL > 0);
+
+  pinMode(PIN_LED, OUTPUT);
+  pinMode(PIN_ENC_SW, INPUT_PULLUP);
+  pinMode(PIN_ENC_A, INPUT_PULLUP);
+  pinMode(PIN_ENC_B, INPUT_PULLUP);
+
+  // Inicjalizacja OLED
+  if (!silent) Serial.println("Inicjalizacja OLED...");
+  delay(200);  // Dłuższe opóźnienie - ekran potrzebuje czasu na rozruch
+  
+  // Wyczyść stan I2C przed inicjalizacją
+  Wire.beginTransmission(0x3C);
+  Wire.endTransmission();
+  delay(50);
+  
+  // Spróbuj najpierw z SSD1306_SWITCHCAPVCC (domyślne dla większości modułów z wewnętrznym boost)
+  bool displayOk = display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  
+  // Jeśli nie zadziałało, spróbuj z SSD1306_EXTERNALVCC (dla modułów bez boostera)
+  if (!displayOk) {
+    if (!silent) Serial.println("Proba z SSD1306_EXTERNALVCC...");
+    delay(100);
+    displayOk = display.begin(SSD1306_EXTERNALVCC, 0x3C);
+  }
+  
+  if (displayOk) {
+    if (!silent) Serial.println("OLED zainicjalizowany poprawnie!");
+    // Poprawna sekwencja inicjalizacji dla Adafruit SSD1306
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.print("ESP32 ROTOR");
+    display.display();  // WYMAGANE - wyświetl zawartość bufora
+    delay(100);
+    if (!silent) Serial.println("Test wyświetlania wykonany.");
+  } else {
+    if (!silent) Serial.println("OLED NIE DZIAŁA - program kontynuuje bez wyświetlacza.");
+  }
+  
+
+  // Inicjalizacja WiFi - zawsze próbuje połączyć z siecią domową, potem AP
+  initWiFi();
+
+  encoder.attachHalfQuad(PIN_ENC_A, PIN_ENC_B);
+  encoder.clearCount();
+  
+  if (!silent) {
+    Serial.printf("TR1D_AZ: %.2f ms/st, TR1D_EL: %.2f ms/st\n", TR1D_AZ, TR1D_EL);
+    Serial.printf("Pozycja startowa: AZ=%d, EL=%d\n", currentAZ, currentEL);
+  }
+
+  // Wykonaj bazowanie po uruchomieniu
+  performHoming();
+}
+
+void loop() {
+  checkAlarms();    // Sprawdź alarmy logiczne
+  // checkRotorComm(); // Wyłączone - rotor CCTV nie obsługuje odpowiedzi (brak nadajnika)
+  
+  // Obsługa powiadomień (jednorazowe, znika po kliknięciu)
+  if (notificationActive) {
+    if (digitalRead(PIN_ENC_SW) == LOW) {
+      delay(BTN_DEBOUNCE_MS);
+      if (digitalRead(PIN_ENC_SW) == LOW) {
+        while (digitalRead(PIN_ENC_SW) == LOW) delay(10);
+        notificationActive = false;  // Usuń powiadomienie po kliknięciu
+      }
+    }
+    // Powiadomienie znika też automatycznie po 5 sekundach
+    if (millis() - notificationStartTime > 5000) {
+      notificationActive = false;
+    }
+  }
+  
+  // Obsługa WebServer (strona WWW z ustawieniami)
+  webServer.handleClient();
+  
+  updatePosition();  // Aktualizuj pozycję na podstawie czasu
+  
+  // Obsługa komend GS-232A w zależności od trybu komunikacji
+  
+  // 1. USBSERIAL - komendy przez Serial USB (bez logów)
+  if (remoteCtrlMode == REMOTE_USBSERIAL) {
+    static char usbCmdBuf[16];
+    static uint8_t usbCmdLen = 0;
+    static unsigned long lastUsbByteMs = 0;
+    bool gotUsbData = false;
+
+    while (Serial.available()) {
+      char c = (char)Serial.read();
+      gotUsbData = true;
+      lastUsbByteMs = millis();
+      if (c == '\r' || c == '\n') {
+        if (usbCmdLen > 0) {
+          usbCmdBuf[usbCmdLen] = '\0';
+          handleGs232Command(usbCmdBuf, usbCmdLen, &Serial, false); // false = bez logów
+          usbCmdLen = 0;
+        }
+      } else {
+        if (usbCmdLen < sizeof(usbCmdBuf) - 1) {
+          usbCmdBuf[usbCmdLen++] = c;
+        }
+      }
+    }
+    // Jeśli brak terminatora, a minął krótki czas - potraktuj bufor jako komendę
+    if (!gotUsbData && usbCmdLen > 0 && (millis() - lastUsbByteMs) > 50) {
+      usbCmdBuf[usbCmdLen] = '\0';
+      handleGs232Command(usbCmdBuf, usbCmdLen, &Serial, false);
+      usbCmdLen = 0;
+    }
+  }
+  
+  // 2. TCPIP - komendy przez WiFi TCP (port 4533)
+  if (remoteCtrlMode == REMOTE_TCPIP) {
+    // Sprawdź czy jest nowe połączenie (nawet jeśli stare jeszcze "wisi")
+    WiFiClient newClient = tcpServer.available();
+    if (newClient) {
+      if (tcpClient && tcpClient.connected()) {
+        tcpClient.stop(); // Zamknij stare połączenie, jeśli przyszło nowe
+      }
+      tcpClient = newClient;
+      tcpClient.setNoDelay(true); // Wyłącz algorytm Nagle'a dla szybszej reakcji
+      Serial.println("[TCP] Nowy klient polaczony");
+    }
+    
+    // Obsługa danych od klienta TCP
+    if (tcpClient && tcpClient.connected()) {
+      static char tcpCmdBuf[64];
+      static uint8_t tcpCmdLen = 0;
+      static unsigned long lastTcpByteMs = 0;
+      
+      while (tcpClient.available()) {
+        char c = (char)tcpClient.read();
+        lastTcpByteMs = millis();
+        if (c == '\r' || c == '\n') {
+          if (tcpCmdLen > 0) {
+            tcpCmdBuf[tcpCmdLen] = '\0';
+            handleRotctldCommand(tcpCmdBuf, tcpCmdLen, &tcpClient, true);
+            tcpCmdLen = 0;
+          }
+        } else {
+          if (tcpCmdLen < sizeof(tcpCmdBuf) - 1) {
+            tcpCmdBuf[tcpCmdLen++] = c;
+          }
+        }
+      }
+      
+      // Timeout dla komend bez terminatora
+      if (tcpCmdLen > 0 && (millis() - lastTcpByteMs) > 100) {
+        tcpCmdBuf[tcpCmdLen] = '\0';
+        handleRotctldCommand(tcpCmdBuf, tcpCmdLen, &tcpClient, true);
+        tcpCmdLen = 0;
+      }
+    }
+  }
+  
+  // Obsługa przycisku enkodera
+  static bool lastSw = HIGH;
+  bool sw = digitalRead(PIN_ENC_SW);
+  
+  if (lastSw == HIGH && sw == LOW) {
+    // Debounce przycisku
+    delay(BTN_DEBOUNCE_MS);
+    if (digitalRead(PIN_ENC_SW) != LOW) {
+      // Fałszywe zbocze (drgania)
+      lastSw = digitalRead(PIN_ENC_SW);
+    } else {
+    unsigned long start = millis();
+    while(digitalRead(PIN_ENC_SW) == LOW) {
+      delay(10);
+    }
+    unsigned long dur = millis() - start;
+    
+    if (dur > 400) {
+      // Długie naciśnięcie - powrót do menu głównego lub wyjście z podmenu
+      if (currentMenu == CALIB_AZ_CONFIRM || currentMenu == CALIB_EL_CONFIRM) {
+        currentMenu = MENU_ROOT;
+      } else       if (currentMenu == ROTOR_SETTINGS || currentMenu == SET_PAN || 
+          currentMenu == SET_TILT || currentMenu == SET_COMM_SPEED || 
+          currentMenu == SET_DIRECTION || currentMenu == REMOTE_CTRL || 
+          currentMenu == REMOTE_CTRL_SELECT) {
+        currentMenu = MENU_ROOT;
+      } else if (currentMenu != MAIN_SCR) {
+        stopMotor();
+        currentMenu = MAIN_SCR;
+      }
+    } else {
+      // Krótkie naciśnięcie - akcja
+      if (currentMenu == MAIN_SCR) {
+        currentMenu = MENU_ROOT;
+      } else if (currentMenu == MENU_ROOT) {
+        if (menuIdx == 0) { 
+          isAutoMode = !isAutoMode; 
+          prefs.putBool("isAutoMode", isAutoMode);
+        }
+        else if (menuIdx == 1) currentMenu = ROTOR_SETTINGS;
+        else if (menuIdx == 2) currentMenu = CALIB_AZ_CONFIRM;
+        else if (menuIdx == 3) currentMenu = CALIB_EL_CONFIRM;
+        else if (menuIdx == 4) currentMenu = ALARMS_MENU;
+        else if (menuIdx == 5) currentMenu = INFO_SCR;
+        else if (menuIdx == 6) currentMenu = REMOTE_CTRL;
+      } else if (currentMenu == CALIB_AZ_CONFIRM) {
+        calibrateAZ();
+        currentMenu = MAIN_SCR;
+        isCalibrated = (TR1D_AZ > 0 && TR1D_EL > 0);
+      } else if (currentMenu == CALIB_EL_CONFIRM) {
+        calibrateEL();
+        currentMenu = MAIN_SCR;
+        isCalibrated = (TR1D_AZ > 0 && TR1D_EL > 0);
+      } else if (currentMenu == ROTOR_SETTINGS) {
+        if (rotorMenuIdx == 0) currentMenu = SET_PAN;
+        else if (rotorMenuIdx == 1) currentMenu = SET_TILT;
+        else if (rotorMenuIdx == 2) currentMenu = SET_COMM_SPEED;
+        else if (rotorMenuIdx == 3) currentMenu = SET_DIRECTION;
+        else if (rotorMenuIdx == 4) currentMenu = SET_PAN_DIR;
+        else if (rotorMenuIdx == 5) currentMenu = SET_TILT_DIR;
+      } else if (currentMenu == SET_PAN || currentMenu == SET_TILT || 
+                 currentMenu == SET_COMM_SPEED || currentMenu == SET_DIRECTION ||
+                 currentMenu == SET_PAN_DIR || currentMenu == SET_TILT_DIR) {
+        // Zapisz ustawienia i wróć do menu ROTOR SETTINGS
+        prefs.putInt("PAN_MAX", PAN_MAX);
+        prefs.putInt("TILT_MAX", TILT_MAX);
+        prefs.putInt("commSpeed", commSpeed);
+        prefs.putInt("direction", direction);
+        prefs.putBool("reversePAN", reversePAN);
+        prefs.putBool("reverseTILT", reverseTILT);
+        
+        // Jeśli zmieniono prędkość komunikacji, zrestartuj Serial2
+        if (currentMenu == SET_COMM_SPEED) {
+          Serial2.end();
+          delay(100);
+          Serial2.begin(commSpeed, SERIAL_8N1, RS485_RX, RS485_TX);
+        }
+        
+        currentMenu = ROTOR_SETTINGS;
+      } else if (currentMenu == REMOTE_CTRL) {
+        if (remoteMenuIdx == 0) {
+          remoteCtrlMode = REMOTE_USBSERIAL;
+          prefs.putInt("remoteCtrlMode", remoteCtrlMode);
+          display.clearDisplay();
+          display.setCursor(0, 20);
+          display.print("Tryb: USBSERIAL");
+          display.setCursor(0, 40);
+          display.print("Restartowanie...");
+          display.display();
+          delay(2000);
+          ESP.restart();
+        } else if (remoteMenuIdx == 1) {
+          remoteCtrlMode = REMOTE_TCPIP;
+          prefs.putInt("remoteCtrlMode", remoteCtrlMode);
+          display.clearDisplay();
+          display.setCursor(0, 20);
+          display.print("Tryb: TCPIP");
+          display.setCursor(0, 40);
+          display.print("Restartowanie...");
+          display.display();
+          delay(2000);
+          ESP.restart();
+        }
+      }
+    }
+    }
+  }
+  lastSw = digitalRead(PIN_ENC_SW);
+
+  // Enkoder
+  static long lPos = 0;
+  static long encRemainder = 0;
+  static unsigned long lastEncoderMove = 0;
+  static unsigned long lastEncoderStepMs = 0;
+
+  long pos = encoder.getCount();
+  long rawDelta = pos - lPos;
+  if (rawDelta != 0) {
+    encRemainder += rawDelta;
+    lPos = pos;
+  }
+
+  int d = 0; // d = liczba "kroków" enkodera (detentów), dodatnia/ujemna
+  unsigned long now = millis();
+  if (abs(encRemainder) >= ENCODER_COUNTS_PER_STEP &&
+      (now - lastEncoderStepMs) >= ENCODER_STEP_MIN_INTERVAL_MS) {
+    d = (int)(encRemainder / ENCODER_COUNTS_PER_STEP);
+    encRemainder -= (long)d * ENCODER_COUNTS_PER_STEP;
+    lastEncoderStepMs = now;
+  }
+
+  if (d != 0) {
+    if (currentMenu == MAIN_SCR && !isAutoMode) {
+      // MAN: target ustawiany lokalnie enkoderem.
+      // Prędkość zmiany targetu zależy od szybkości kręcenia enkodera.
+      unsigned long dt = now - lastEncoderMove;
+      int stepScale = 1;
+      if (dt <= 40) stepScale = 10;
+      else if (dt <= 80) stepScale = 5;
+      else if (dt <= 150) stepScale = 2;
+      int dScaled = (d > 0) ? stepScale : -stepScale;
+
+      // Zmieniaj tylko AZ (EL zostawiamy do rozbudowy/komendy z aplikacji)
+      targetAZ = constrain(targetAZ + dScaled, 0, PAN_MAX);
+      lastEncoderMove = now;
+    } else if (currentMenu == MENU_ROOT) {
+      menuIdx = constrain(menuIdx + d, 0, 6);
+    } else if (currentMenu == ALARMS_MENU) {
+      // Policz aktywne alarmy
+      int activeCount = 0;
+      for (int i = 0; i < MAX_ALARMS - 1; i++) {
+        if (alarms[i].active) activeCount++;
+      }
+      alarmMenuIdx = constrain(alarmMenuIdx + d, 0, max(0, activeCount - 1));
+    } else if (currentMenu == ROTOR_SETTINGS) {
+      rotorMenuIdx = constrain(rotorMenuIdx + d, 0, 5);
+    } else if (currentMenu == SET_PAN) {
+      PAN_MAX = constrain(PAN_MAX + d, 0, 365);
+    } else if (currentMenu == SET_TILT) {
+      TILT_MAX = constrain(TILT_MAX + d, 0, 90);
+    } else if (currentMenu == SET_COMM_SPEED) {
+      // Przełącz między 2400 a 9600 (jedno kliknięcie = zmiana)
+      commSpeed = (commSpeed == 2400) ? 9600 : 2400;
+    } else if (currentMenu == SET_DIRECTION) {
+      direction = constrain(direction + d, 0, 359);
+    } else if (currentMenu == SET_PAN_DIR) {
+      if (d != 0) reversePAN = !reversePAN;
+    } else if (currentMenu == SET_TILT_DIR) {
+      if (d != 0) reverseTILT = !reverseTILT;
+    } else if (currentMenu == REMOTE_CTRL) {
+      remoteMenuIdx = constrain(remoteMenuIdx + d, 0, 1);
+    }
+  }
+
+  // Sterowanie silnikiem
+  if (isCalibrated) {
+    // AUTO: target z aplikacji (BT). MAN: target z enkodera.
+    // Sterowanie do targetu działa w obu trybach.
+    int diffAZ = targetAZ - currentAZ;
+    int diffEL = targetEL - currentEL;
+
+    // Mechanizm zabezpieczający przed oscylacjami dla AZ
+    if (targetAZ != oscProtectAZ.lastTargetAZ) {
+      // Nowy cel - resetuj licznik prób
+      oscProtectAZ.attemptCount = 0;
+      oscProtectAZ.bestPosition = currentAZ;
+      oscProtectAZ.bestDiff = abs(diffAZ);
+      oscProtectAZ.lastDirection = 0;
+      oscProtectAZ.lastTargetAZ = targetAZ;
+    } else if (motorIsAZ && motorRunning) {
+      // Sprawdź czy przekroczyliśmy cel podczas ruchu
+      bool overshot = false;
+      if (motorDirection > 0 && currentAZ > targetAZ) {
+        // Jedziemy w prawo i przekroczyliśmy cel
+        overshot = true;
+      } else if (motorDirection < 0 && currentAZ < targetAZ) {
+        // Jedziemy w lewo i przekroczyliśmy cel
+        overshot = true;
+      }
+      
+      if (overshot && oscProtectAZ.lastDirection == motorDirection) {
+        // Przekroczyliśmy cel w tym samym kierunku co ostatnio = próba
+        oscProtectAZ.attemptCount++;
+        Serial.printf("[OSC PROTECT AZ] Przekroczono cel - proba %d/3 (poz: %d, cel: %d)\n", 
+                   oscProtectAZ.attemptCount, currentAZ, targetAZ);
+        
+        if (oscProtectAZ.attemptCount >= 3) {
+          // Po 3 próbach - zatrzymaj się na najlepszej pozycji
+          Serial.printf("[OSC PROTECT AZ] Osiagnieto limit 3 prob - zatrzymanie na pozycji %d (cel: %d)\n", 
+                       oscProtectAZ.bestPosition, targetAZ);
+          stopMotor();
+          // Ustaw target na najlepszą pozycję (zatrzymaj się)
+          targetAZ = oscProtectAZ.bestPosition;
+          currentAZ = oscProtectAZ.bestPosition;
+          prefs.putInt("currentAZ", currentAZ);
+          oscProtectAZ.attemptCount = 0;  // Reset dla następnego celu
+          return;  // Wyjdź z funkcji - nie próbuj już jechać
+        }
+      }
+      
+      if (overshot) {
+        oscProtectAZ.lastDirection = motorDirection;
+      }
+      
+      // Aktualizuj najlepszą pozycję (najbliższą do celu)
+      if (abs(diffAZ) < oscProtectAZ.bestDiff) {
+        oscProtectAZ.bestPosition = currentAZ;
+        oscProtectAZ.bestDiff = abs(diffAZ);
+      }
+    } else if (abs(diffAZ) <= 1) {
+      // Osiągnięto cel - resetuj licznik prób
+      oscProtectAZ.attemptCount = 0;
+      oscProtectAZ.lastDirection = 0;
+    }
+
+    // Mechanizm zabezpieczający przed oscylacjami dla EL
+    if (targetEL != oscProtectEL.lastTargetEL) {
+      // Nowy cel - resetuj licznik prób
+      oscProtectEL.attemptCount = 0;
+      oscProtectEL.bestPosition = currentEL;
+      oscProtectEL.bestDiff = abs(diffEL);
+      oscProtectEL.lastDirection = 0;
+      oscProtectEL.lastTargetEL = targetEL;
+    } else if (!motorIsAZ && motorRunning) {
+      // Sprawdź czy przekroczyliśmy cel podczas ruchu
+      bool overshot = false;
+      if (motorDirection > 0 && currentEL > targetEL) {
+        // Jedziemy w górę i przekroczyliśmy cel
+        overshot = true;
+      } else if (motorDirection < 0 && currentEL < targetEL) {
+        // Jedziemy w dół i przekroczyliśmy cel
+        overshot = true;
+      }
+      
+      if (overshot && oscProtectEL.lastDirection == motorDirection) {
+        // Przekroczyliśmy cel w tym samym kierunku co ostatnio = próba
+        oscProtectEL.attemptCount++;
+        Serial.printf("[OSC PROTECT EL] Przekroczono cel - proba %d/3 (poz: %d, cel: %d)\n", 
+                     oscProtectEL.attemptCount, currentEL, targetEL);
+        
+        if (oscProtectEL.attemptCount >= 3) {
+          // Po 3 próbach - zatrzymaj się na najlepszej pozycji
+          Serial.printf("[OSC PROTECT EL] Osiagnieto limit 3 prob - zatrzymanie na pozycji %d (cel: %d)\n", 
+                       oscProtectEL.bestPosition, targetEL);
+          stopMotor();
+          // Ustaw target na najlepszą pozycję
+          targetEL = oscProtectEL.bestPosition;
+          currentEL = oscProtectEL.bestPosition;
+          prefs.putInt("currentEL", currentEL);
+          oscProtectEL.attemptCount = 0;
+          return;  // Wyjdź z funkcji
+        }
+      }
+      
+      if (overshot) {
+        oscProtectEL.lastDirection = motorDirection;
+      }
+      
+      // Aktualizuj najlepszą pozycję
+      if (abs(diffEL) < oscProtectEL.bestDiff) {
+        oscProtectEL.bestPosition = currentEL;
+        oscProtectEL.bestDiff = abs(diffEL);
+      }
+    } else if (abs(diffEL) <= 1) {
+      // Osiągnięto cel - resetuj licznik prób
+      oscProtectEL.attemptCount = 0;
+      oscProtectEL.lastDirection = 0;
+    }
+
+    if (abs(diffAZ) > 1) {
+      // Najpierw AZ
+      if (!motorRunning || motorIsAZ) {
+        startMotor((diffAZ > 0) ? 1 : -1, true);
+      }
+    } else if (abs(diffEL) > 1) {
+      // Potem EL
+      if (!motorRunning || !motorIsAZ) {
+        startMotor((diffEL > 0) ? 1 : -1, false);
+      }
+  } else {
+      // Osiągnięto cel - zatrzymaj tylko jeśli silnik był uruchomiony
+      if (motorRunning) {
+        stopMotor();
+      }
+    }
+  } else {
+    // Brak kalibracji - zatrzymaj silnik (tylko raz jeśli był uruchomiony)
+    if (motorRunning) {
+      stopMotor();
+    }
+  }
+  
+  // LOGIKA LED: Miga podczas obrotu, świeci gdy stoi
+  if (motorRunning) {
+    digitalWrite(PIN_LED, (millis() / 200) % 2);  // Migaj podczas obrotu
+  } else {
+    digitalWrite(PIN_LED, HIGH);  // Świeci ciągle gdy stoi
+  }
+
+  // Wyświetlanie
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+
+  // Powiadomienie (jednorazowe) – pokazuj jako pełnoekranowe
+  if (notificationActive) {
+    display.setCursor(0, 0);
+    display.setTextSize(2);
+    display.print("!");
+    display.setTextSize(1);
+    display.setCursor(12, 0);
+    display.print("ALARM");
+    display.setCursor(0, 16);
+    display.print(notificationMessage);
+    display.setCursor(0, 56);
+    display.print("Kliknij aby zamknac");
+  display.display();
+    delay(10);
+    return;
+  }
+
+  if (currentMenu == MAIN_SCR) {
+    // --- Ekran główny ---
+    // Góra: mała czcionka AUTO/MANUAL
+    display.setCursor(0, 0);
+    display.print(isAutoMode ? "AUTO" : "MANUAL");
+
+    // Prawy górny róg: aktualna elewacja (CUR) - WIĘKSZA CZCIONKA
+    char elBuf[12];
+    int userEL = getUserElevation();
+    snprintf(elBuf, sizeof(elBuf), "EL:%d", userEL);
+    display.setTextSize(2);
+    int elX = 128 - ((int)strlen(elBuf) * 12); // 12 px na znak przy setTextSize(2)
+    if (elX < 0) elX = 0;
+    display.setCursor(elX, 0); 
+    display.print(elBuf);
+    display.setTextSize(1);
+
+    // Sprawdź czy są aktywne alarmy (np. brak kalibracji)
+    bool anyAlarm = false;
+    for (int i = 0; i < MAX_ALARMS - 1; i++) {
+      if (alarms[i].active) { anyAlarm = true; break; }
+    }
+
+    // Środek: duża czcionka, tylko liczby TGT/CUR
+    int curGeoAZ = getGeographicAzimuth();
+    int tgtGeoAZ = internalToGeographic(targetAZ);
+    display.setTextSize(3);
+    display.setCursor(0, 22);
+    display.printf("%03d/%03d", tgtGeoAZ, curGeoAZ);
+    display.setTextSize(1);
+
+    // Dół: MENU> (+ ALARM! jeśli są alarmy)
+    display.setCursor(0, 56);
+    display.print("MENU>");
+    if (anyAlarm) {
+      display.setCursor(68, 56);
+      display.print("ALARM!");
+    }
+  } else {
+    // --- Ekrany menu / ustawień (bez nakładania na ekran główny) ---
+    display.setCursor(0, 0);
+    if (currentMenu == INFO_SCR) display.print("INFO:");
+    else if (currentMenu == ALARMS_MENU) display.print("ALARMY:");
+    else if (currentMenu == CALIB_AZ_CONFIRM) display.print("KALIB AZ");
+    else if (currentMenu == CALIB_EL_CONFIRM) display.print("KALIB EL");
+    else display.print("MENU");
+
+    if (currentMenu == MENU_ROOT) {
+      const char* menuItems[] = {"AUTO/MANUAL", "ROTOR SET", "KALIB AZ", "KALIB EL", "ALARMY", "INFO", "REMOTE CTRL"};
+      display.setCursor(0, 18);
+      display.print(">");
+      display.setCursor(10, 18);
+      display.print(menuItems[menuIdx]);
+      if (menuIdx == 0) {
+        // Pod spodem pokaż aktualny tryb większą czcionką
+        display.setCursor(0, 40);
+        display.setTextSize(2);
+        display.print(isAutoMode ? "AUTO" : "MANUAL");
+        display.setTextSize(1);
+      }
+    } else if (currentMenu == ROTOR_SETTINGS) {
+      const char* rotorItems[] = {"PAN", "TILT", "SPEED", "DIR", "PAN SCALE", "TILT SCALE"};
+      display.setCursor(0, 18);
+      display.print("ROTOR SET:");
+      display.setCursor(0, 32);
+      display.print(">");
+      display.setCursor(10, 32);
+      display.print(rotorItems[rotorMenuIdx]);
+      display.setCursor(0, 48);
+      if (rotorMenuIdx == 0) display.printf("PAN=%03d", PAN_MAX);
+      else if (rotorMenuIdx == 1) display.printf("TILT=%02d", TILT_MAX);
+      else if (rotorMenuIdx == 2) display.printf("SPD=%d", commSpeed);
+      else if (rotorMenuIdx == 3) display.printf("DIR=%03d", direction);
+      else if (rotorMenuIdx == 4) display.printf("PAN:%s", reversePAN ? "REV" : "NORM");
+      else if (rotorMenuIdx == 5) display.printf("TILT:%s", reverseTILT ? "REV" : "NORM");
+    } else if (currentMenu == SET_PAN) {
+      display.setCursor(0, 18);
+      display.print("PAN MAX:");
+      display.setCursor(0, 32);
+      display.setTextSize(2);
+      display.printf("%03d", PAN_MAX);
+      display.setTextSize(1);
+      display.setCursor(0, 56);
+      display.print("Kliknij OK");
+    } else if (currentMenu == SET_TILT) {
+      display.setCursor(0, 18);
+      display.print("TILT MAX:");
+      display.setCursor(0, 32);
+      display.setTextSize(2);
+      display.printf("%02d", TILT_MAX);
+      display.setTextSize(1);
+      display.setCursor(0, 56);
+      display.print("Kliknij OK");
+    } else if (currentMenu == SET_COMM_SPEED) {
+      display.setCursor(0, 18);
+      display.print("COMM SPEED:");
+      display.setCursor(0, 32);
+      display.setTextSize(2);
+      display.printf("%d", commSpeed);
+      display.setTextSize(1);
+      display.setCursor(0, 56);
+      display.print("Kliknij OK");
+    } else if (currentMenu == SET_DIRECTION) {
+      display.setCursor(0, 18);
+      display.print("DIRECTION:");
+      display.setCursor(0, 32);
+      display.setTextSize(2);
+      display.printf("%03d", direction);
+      display.setTextSize(1);
+      display.setCursor(0, 56);
+      display.print("Kliknij OK");
+    } else if (currentMenu == SET_PAN_DIR) {
+      display.setCursor(0, 18);
+      display.print("PAN SCALE:");
+      display.setCursor(0, 32);
+      display.setTextSize(2);
+      display.print(reversePAN ? "REVERSE" : "NORMAL");
+      display.setTextSize(1);
+      display.setCursor(0, 56);
+      display.print("Kliknij OK");
+    } else if (currentMenu == SET_TILT_DIR) {
+      display.setCursor(0, 18);
+      display.print("TILT SCALE:");
+      display.setCursor(0, 32);
+      display.setTextSize(2);
+      display.print(reverseTILT ? "REVERSE" : "NORMAL");
+      display.setTextSize(1);
+      display.setCursor(0, 56);
+      display.print("Kliknij OK");
+    } else if (currentMenu == ALARMS_MENU) {
+      // Nagłówek jest już na górze: ALARMY:
+      // pokaż wybrany aktywny alarm
+      int idx = 0;
+      bool any = false;
+      for (int i = 0; i < MAX_ALARMS - 1; i++) {
+        if (!alarms[i].active) continue;
+        any = true;
+        if (idx == alarmMenuIdx) {
+          display.setCursor(0, 18);
+          display.print(">");
+          display.setCursor(10, 18);
+          display.print(alarms[i].message);
+          break;
+        }
+        idx++;
+      }
+      if (!any) {
+        display.setCursor(0, 18);
+        display.print("Brak alarmow");
+      }
+      display.setCursor(0, 56);
+      display.print("Hold=Powrot");
+    } else if (currentMenu == CALIB_AZ_CONFIRM) {
+      // Bez "MENU" u góry – tylko instrukcja
+      display.setCursor(0, 22);
+      display.print("Aby rozpoczac");
+      display.setCursor(0, 34);
+      display.print("kalibracje nacisnij");
+      display.setCursor(0, 46);
+      display.print("przycisk");
+      display.setCursor(0, 56);
+      display.print("Hold=Powrot");
+    } else if (currentMenu == CALIB_EL_CONFIRM) {
+      display.setCursor(0, 22);
+      display.print("Aby rozpoczac");
+      display.setCursor(0, 34);
+      display.print("kalibracje nacisnij");
+      display.setCursor(0, 46);
+      display.print("przycisk");
+      display.setCursor(0, 56);
+      display.print("Hold=Powrot");
+    } else if (currentMenu == INFO_SCR) {
+      // Nagłówek jest już na górze: INFO:
+      // Odstępy między wierszami: 11 px
+      display.setCursor(0, 12);
+      display.printf("TR_AZ: %.2f", TR1D_AZ);
+      display.setCursor(0, 23);
+      display.printf("TR_EL: %.2f", TR1D_EL);
+      display.setCursor(0, 34);
+      display.printf("PAN:%d TILT:%d", PAN_MAX, TILT_MAX);
+      // SPEED/DIR/kalibracja
+      display.setCursor(0, 45);
+      display.printf("SPD:%d DIR:%03d%s", commSpeed, direction, isCalibrated ? "" : " !");
+      // IP na dole
+      String ipStr = wifiConnected ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
+      display.setCursor(0, 55);
+      display.print("IP: ");
+      display.print(ipStr);
+    } else if (currentMenu == REMOTE_CTRL) {
+      const char* remoteItems[] = {"USBSERIAL", "TCPIP"};
+      display.setCursor(0, 18);
+      display.print("REMOTE CTRL:");
+      display.setCursor(0, 32);
+      display.print(">");
+      display.setCursor(10, 32);
+      display.print(remoteItems[remoteMenuIdx]);
+      display.setCursor(0, 48);
+      display.print("Kliknij wybierz");
+      display.setCursor(0, 56);
+      display.print("Hold=Powrot");
+    }
+  }
+  
+  display.display();
+  
+  delay(10);  // Małe opóźnienie dla stabilności
+}
